@@ -387,24 +387,24 @@ describe("OtelEnvironment", () => {
 });
 
 describe("isRelayTracingEnabled", () => {
-  it("defaults on and respects the T3CODE SDK override of the standard kill switch", () => {
-    assert.isTrue(OtelEnvironment.isRelayTracingEnabled({}));
-    assert.isFalse(OtelEnvironment.isRelayTracingEnabled({ OTEL_SDK_DISABLED: "true" }));
-    assert.isTrue(
+  it("is always false so relay traces never leave this build", () => {
+    assert.isFalse(OtelEnvironment.isRelayTracingEnabled({}));
+    assert.isFalse(
       OtelEnvironment.isRelayTracingEnabled({
-        OTEL_SDK_DISABLED: "true",
+        T3CODE_TELEMETRY_ENABLED: "true",
+        OTEL_SDK_DISABLED: "false",
         T3CODE_OTEL_SDK_DISABLED: "false",
       }),
     );
     assert.isFalse(
       OtelEnvironment.isRelayTracingEnabled({
-        OTEL_SDK_DISABLED: "false",
-        T3CODE_OTEL_SDK_DISABLED: "true",
+        OTEL_SDK_DISABLED: "true",
+        T3CODE_OTEL_SDK_DISABLED: "false",
       }),
     );
   });
 
-  it.effect("product opt-out beats SDK enable without disabling user-configured tracing", () =>
+  it.effect("leaves user-configured OTLP tracing untouched", () =>
     Effect.gen(function* () {
       const env = {
         T3CODE_TELEMETRY_ENABLED: "false",
@@ -412,7 +412,6 @@ describe("isRelayTracingEnabled", () => {
         OTEL_SDK_DISABLED: "true",
         OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "https://user.example.test/v1/traces",
       };
-      assert.isFalse(OtelEnvironment.isRelayTracingEnabled(env));
 
       const otel = yield* load(env);
       assert.isFalse(otel.disabled);

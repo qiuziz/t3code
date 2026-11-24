@@ -1,0 +1,59 @@
+name: Sync upstream
+
+# Merges pingdotgg/t3code main into this fork once a day. A clean merge pushes to
+# main and starts Build custom desktop; conflicts stop here for a manual fix.
+
+on:
+  schedule:
+    # 20:00 UTC is 04:00 Asia/Shanghai.
+    - cron: "0 20 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    name: Merge upstream main
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/pingdotgg/t3code.git
+          git fetch --no-tags upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with upstream/main."
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git merge --no-edit upstream/main; then
+            git merge --abort
+            echo "::error::Upstream merge conflicts with this fork; merge it locally and push the resolution."
+            exit 1
+          fi
+          git push origin main
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+
+      # A push made with GITHUB_TOKEN does not start other workflows, so start the
+      # desktop build explicitly after a merge lands.
+      - name: Trigger custom desktop build
+        if: steps.merge.outputs.merged == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build-custom-desktop.yml --ref main

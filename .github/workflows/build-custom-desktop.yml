@@ -1,0 +1,73 @@
+name: Build custom desktop
+
+# Builds this fork's macOS (Apple Silicon) DMG on every push to main and on demand.
+# The bundle is built once, then packaged; the DMG and a draft release are published.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: custom-desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-arm64:
+    name: macOS arm64 DMG
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Installs Vite+ (vp) at the version package.json pins and the workspace
+      # dependencies from pnpm-lock.yaml.
+      - name: Set up Vite+ and install dependencies
+        uses: ./.github/actions/setup-ci-deps
+
+      - name: Build desktop bundle
+        run: vp run build:desktop:bundle
+
+      - name: Package macOS arm64 DMG
+        env:
+          # This fork ships unsigned; do not look for a local signing identity.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: vp run dist:desktop:artifact --platform mac --target dmg --arch arm64 --skip-build
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: t3-code-custom-macos-arm64
+          path: |
+            release/*.dmg
+            release/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(release/*.dmg release/*.zip)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "::error::No desktop artifacts were produced."
+            exit 1
+          fi
+          version="$(node -p "require('./apps/desktop/package.json').version")"
+          day="$(date -u +%Y%m%d)"
+          tag="v${version}-custom-${day}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" "${files[@]}" \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --title "T3 Code Custom ${version} (${day})" \
+              --notes "Custom macOS arm64 build: telemetry removed, local proxy defaults built in, and the Iris badge-fix theme and custom bundle identifier (com.qiuz.t3code) applied. Unsigned."
+          fi

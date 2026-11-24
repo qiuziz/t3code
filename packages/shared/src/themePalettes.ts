@@ -907,6 +907,11 @@ export const IRIS_THEME: ThemeDefinition = {
       terminalScrollbarHover: "oklch(0.676012 0.015271 305.433)",
     },
   },
+  // Provider badges: keep CJK initials on one line so they stop overlapping the icon.
+  css: `[data-provider-accent-color] > span:last-child {
+  white-space: nowrap !important;
+}
+`,
   sidebarArtwork: true,
 };
 
