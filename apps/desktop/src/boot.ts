@@ -7,8 +7,8 @@ const DEFAULT_NO_PROXY =
 
 // The backend is a separate Node process that reads this at its own startup.
 process.env.NODE_USE_ENV_PROXY = "1";
-if (!process.env.HTTPS_PROXY) process.env.HTTPS_PROXY = DEFAULT_PROXY_URL;
-if (!process.env.HTTP_PROXY) process.env.HTTP_PROXY = DEFAULT_PROXY_URL;
+if (!process.env.HTTPS_PROXY && !process.env.https_proxy) process.env.HTTPS_PROXY = DEFAULT_PROXY_URL;
+if (!process.env.HTTP_PROXY && !process.env.http_proxy) process.env.HTTP_PROXY = DEFAULT_PROXY_URL;
 if (!process.env.NO_PROXY) process.env.NO_PROXY = DEFAULT_NO_PROXY;
 if (!process.env.no_proxy) process.env.no_proxy = DEFAULT_NO_PROXY;
 // Telemetry stays off in every process this app starts.
