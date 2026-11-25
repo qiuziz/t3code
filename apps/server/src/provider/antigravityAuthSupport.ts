@@ -234,6 +234,9 @@ function antigravityEnvironment(
       : {}),
     GEMINI_HOME: profile.geminiHome,
     AGY_ACP_FORCE_FILE_STORAGE: "1",
+    // 1.5.x dropped the old var and prefers the OS keyring unless this one is set, which would make
+    // every profile share one signed-in account. Force the profile's own token file instead.
+    AGY_CLI_FORCE_FILE_TOKEN_STORAGE: "1",
     // agy's troubleshooting docs specify "true"; the interactive CLI keeps self-updating with "1".
     AGY_CLI_DISABLE_AUTO_UPDATE: "true",
     BROWSER: profile.browserCommand,
