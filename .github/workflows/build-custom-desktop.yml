@@ -100,15 +100,30 @@ jobs:
           T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: ${{ steps.resource_monitor_cache.outputs.cache-hit == 'true' }}
         run: vp run dist:desktop:artifact --platform mac --target dmg --arch arm64 --skip-build
 
-      - name: Upload DMG
+      # Keep Actions artifact storage tiny (Free plan 500 MB). Binaries live on the release only.
+      - name: Write release checksum manifest
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p release/checksums
+          {
+            echo "version=$(node -p "require('./apps/desktop/package.json').version")"
+            echo "sha=${GITHUB_SHA}"
+            echo "built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > release/checksums/build-metadata.txt
+          for f in release/*.dmg release/*.zip; do
+            base="$(basename "$f")"
+            shasum -a 256 "$f" | awk -v n="$base" '{print $1 "  " n}' >> release/checksums/SHASUMS256.txt
+            ls -l "$f" >> release/checksums/artifact-sizes.txt
+          done
+
+      - name: Upload build metadata (artifact storage)
         uses: actions/upload-artifact@v4
         with:
-          name: t3-code-custom-macos-arm64
-          path: |
-            release/*.dmg
-            release/*.zip
+          name: t3-code-custom-macos-arm64-metadata
+          path: release/checksums/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
 
       - name: Publish draft release
         env:
