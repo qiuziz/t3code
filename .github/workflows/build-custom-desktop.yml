@@ -6,6 +6,14 @@ name: Build custom desktop
 on:
   push:
     branches: [main]
+    # Avoid rebuilding on unrelated upstream sync commits; manual dispatch still builds any ref.
+    paths:
+      - ".github/workflows/build-custom-desktop.yml"
+      - "apps/desktop/**"
+      - "native/**"
+      - "scripts/build-desktop-artifact.ts"
+      - "package.json"
+      - "pnpm-lock.yaml"
   workflow_dispatch:
     inputs:
       runner:
@@ -16,18 +24,27 @@ on:
 permissions:
   contents: write
 
+# Do not cancel a queued macOS job when another run is requested — GitHub often
+# takes >10m to assign a hosted macOS runner; cancel-in-progress left billable_ms at 0.
 concurrency:
   group: custom-desktop-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   macos-arm64:
     name: macOS arm64 DMG
     # macos-14 is retired; macos-latest resolves to macos-26 (arm64, Xcode 26).
     # Pass runner=macos-15 on workflow_dispatch if macos-latest queues too long.
-    runs-on: ${{ inputs.runner || 'macos-latest' }}
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || 'macos-latest' }}
     timeout-minutes: 90
     steps:
+      - name: Runner diagnostics
+        run: |
+          set -x
+          date -u
+          sw_vers || true
+          xcodebuild -version || true
+
       # Exclude .repos/ whose orphaned gitlinks fail actions/checkout's submodule cleanup.
       - name: Checkout
         uses: actions/checkout@v4
