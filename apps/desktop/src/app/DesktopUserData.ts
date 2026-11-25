@@ -39,14 +39,9 @@ export const resolveUserDataPath = Effect.fn("desktop.userData.resolveUserDataPa
   }) {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    // A build that ships beside the official app needs its own profile: Electron's
-    // single-instance lock lives in userData, and a shared directory makes the two apps
-    // quit each other on launch.
-    // oxlint-disable-next-line t3code/no-global-process-runtime -- Electron resolves this path before any runtime exists.
-    const suffix = process.env.T3CODE_DESKTOP_USER_DATA_SUFFIX ?? "";
     const names = input.isDevelopment
-      ? { current: `t3code-dev${suffix}`, legacy: "T3 Code (Dev)" }
-      : { current: `t3code-v2${suffix}`, legacy: "T3 Code (Alpha)" };
+      ? { current: "t3code-dev", legacy: "T3 Code (Dev)" }
+      : { current: "t3code-v2", legacy: "T3 Code (Alpha)" };
     const destinationPath = path.join(input.appDataDirectory, names.current);
     const legacyPath = path.join(input.appDataDirectory, names.legacy);
     const inspect = (resourcePath: string) =>
