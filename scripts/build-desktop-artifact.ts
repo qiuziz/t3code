@@ -2821,7 +2821,13 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   arch?: typeof BuildArch.Type,
 ) {
   const buildConfig: Record<string, unknown> = {
-    afterPack: (yield* Path.Path).join(yield* RepoRoot, "scripts/prepare-server-compile-cache.cjs"),
+    afterPack: (yield* Path.Path).join(
+      yield* RepoRoot,
+      // Unsigned macOS builds still need a valid signature; this hook also runs the compile cache.
+      platform === "mac" && !signed
+        ? "scripts/adhoc-sign-after-pack.cjs"
+        : "scripts/prepare-server-compile-cache.cjs",
+    ),
     appId: DESKTOP_APP_ID,
     productName: resolveDesktopProductName(version),
     artifactName: "T3-Code-${version}-${arch}.${ext}",

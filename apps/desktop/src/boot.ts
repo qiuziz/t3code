@@ -13,6 +13,11 @@ if (!process.env.NO_PROXY) process.env.NO_PROXY = DEFAULT_NO_PROXY;
 if (!process.env.no_proxy) process.env.no_proxy = DEFAULT_NO_PROXY;
 // Telemetry stays off in every process this app starts.
 process.env.T3CODE_TELEMETRY_ENABLED = "0";
+// This fork installs beside the official app. Give it its own Electron profile so the two do
+// not fight over the single-instance lock (the official app owns the plain userData directory).
+if (!process.env.T3CODE_DESKTOP_USER_DATA_SUFFIX) {
+  process.env.T3CODE_DESKTOP_USER_DATA_SUFFIX = "-custom";
+}
 
 require("./compileCache.cjs");
 require("./main.cjs");
