@@ -117,7 +117,9 @@ jobs:
         if: steps.merge.outputs.conflict == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run build-custom-desktop.yml --ref main
+        # --repo is required: with an `upstream` remote present, gh otherwise resolves the
+        # workflow against pingdotgg/t3code and fails with "workflow not found".
+        run: gh workflow run build-custom-desktop.yml --repo "${{ github.repository }}" --ref main
 
       - name: Open a conflict issue
         if: steps.merge.outputs.conflict == 'true'
