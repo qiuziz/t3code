@@ -73,6 +73,49 @@ export const ACP_REGISTRY_DEFAULT_INSTANCE_ID = defaultInstanceIdForDriver(ACP_R
 const DEFAULT_ACP_REGISTRY_SETTINGS = Schema.decodeSync(AcpRegistrySettings)({});
 const isAcpRequestError = Schema.is(EffectAcpErrors.AcpRequestError);
 
+/** Local-install CodeBuddy (`cbc --acp`) and its registry id. */
+export function isCodeBuddyAgent(settings: AcpRegistrySettings): boolean {
+  if (settings.source !== "local") return settings.agentId === "codebuddy";
+  return /^(?:cbc|codebuddy)(\.exe|\.cmd)?$/i.test(
+    settings.commandPath.split(/[\\/]/).pop() ?? "",
+  );
+}
+
+/**
+ * CodeBuddy's non-standard `session/steer`: it buffers the message into the running
+ * turn and answers `{ steered, ownerRequestId }`. A false reply (idle turn, or content
+ * it will not inject) fails so the orchestrator queues the message as a follow-up.
+ */
+export const sendCodeBuddySteer = (
+  runtime: AcpSessionRuntime.AcpSessionRuntime["Service"],
+  sessionId: string,
+  text: string,
+  images: ReadonlyArray<EffectAcpSchema.ContentBlock>,
+): Effect.Effect<string | undefined, EffectAcpErrors.AcpError> =>
+  runtime
+    .request("session/steer", {
+      sessionId,
+      contentBlocks: [{ type: "text" as const, text }, ...images],
+    })
+    .pipe(
+      Effect.flatMap((result) => {
+        const steered =
+          typeof result === "object" && result !== null
+            ? (result as { steered?: unknown }).steered
+            : undefined;
+        if (steered === false) {
+          return Effect.fail(
+            new EffectAcpErrors.AcpTransportError({
+              method: "session/steer",
+              detail: "CodeBuddy declined the steering message",
+              cause: result,
+            }),
+          );
+        }
+        return Effect.undefined;
+      }),
+    );
+
 export interface AcpRegistryAdapterV2Options {
   readonly instanceId: Parameters<typeof makeAcpAdapterV2>[0]["instanceId"];
   readonly settings: AcpRegistrySettings;
@@ -244,6 +287,9 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
       /^(?:mistral-)?vibe(?:-acp)?(\.exe|\.cmd)?$/i.test(
         options.settings.commandPath.split(/[\\/]/).pop() ?? "",
       ));
+  // CodeBuddy (`cbc --acp`) takes a non-standard `session/steer` that buffers a
+  // message into the running turn and answers `{ steered, ownerRequestId }`.
+  const isCodeBuddy = isCodeBuddyAgent(options.settings);
   const runtimeOptions = isClaude
     ? {
         ...options,
@@ -271,9 +317,15 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
           ...AcpProviderCapabilitiesV2,
           turns: { ...AcpProviderCapabilitiesV2.turns, supportsSteeringByInterruptRestart: false },
         }
-      : AcpProviderCapabilitiesV2,
+      : isCodeBuddy
+        ? {
+            ...AcpProviderCapabilitiesV2,
+            turns: { ...AcpProviderCapabilitiesV2.turns, supportsActiveSteering: true },
+          }
+        : AcpProviderCapabilitiesV2,
     customModels: readCustomModelEntries(options.settings.customModels).map((entry) => entry.slug),
     compactViaAdvertisedCommand: true,
+    ...(isCodeBuddy ? { steering: { send: sendCodeBuddySteer } } : {}),
     ...(isAntigravityCli ? { wakeOnDetachedRequest: true, replyEndsWithUsageUpdate: true } : {}),
     promptFailure: (cause) =>
       acpRegistryPromptFailure(isVibe ? "mistral-vibe" : registryAgentId, cause),
