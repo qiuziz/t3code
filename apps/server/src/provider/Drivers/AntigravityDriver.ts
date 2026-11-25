@@ -579,6 +579,7 @@ export const AntigravityDriver: ProviderDriver<
       gcpProject: auth.gcpProject,
       gcpLocation: auth.gcpLocation,
       environment: processEnvironment,
+      spawner,
       resolveExecutable: installation.acquire(settings.binaryPath, processEnvironment).pipe(
         Effect.map((resolved) => resolved.executablePath),
         Effect.mapError(

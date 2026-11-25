@@ -12,90 +12,142 @@ import * as TestClock from "effect/testing/TestClock";
 
 import {
   AntigravityCliUsageError,
-  antigravityAccountFingerprint,
   antigravityEmailFingerprint,
-  antigravitySummaryWindows,
+  antigravityTokenEmail,
   buildAntigravityCliUsageEnv,
   makeAntigravityUsageProbe,
   parseAntigravityCliUsageOutput,
-  runOfficialAgyUsagePty,
   type AntigravityCliUsageRunInput,
-  type AntigravityNodePtyModule,
 } from "./antigravityUsageLimits.ts";
 
-const SAMPLE_CLI_OUTPUT = [
-  "\x1b[2J\x1b[1;1HModels & Quota  Account: user@example.com",
-  "",
-  "GEMINI MODELS",
-  "  Models within this group: Gemini 4 Neon, Gemini 4 Carbon",
-  "",
-  "  Weekly Limit Remaining",
-  "    [████████████████████████████████████░░] 91.26%",
-  "    Refreshes in 156h 19m",
-  "",
-  "  Five Hour Limit Remaining",
-  "    [██████████████████████████████████████░] 95.89%",
-  "    Refreshes in 4h 17m",
-  "",
-  "CLAUDE AND GPT MODELS",
-  "  Models within this group: Claude Sonnet 4.6, Claude Opus 4.6, GPT-OSS 120B",
-  "",
-  "  Weekly Limit Remaining",
-  "    [████████████████████████████████████████] 100.00%",
-  "    Refreshes in 117h 54m",
-  "",
-  "  Five Hour Limit Remaining",
-  "    [████████████████████████████████████████] 100.00%",
-  "    Quota available",
-].join("\n");
+const SAMPLE_CLI_JSON = JSON.stringify({
+  conversation_id: "",
+  status: "SUCCESS",
+  response: "Gemini Models\tWeekly Limit Remaining\t91.26%\t2026-11-30T15:19:00Z",
+  command: {
+    name: "usage",
+    data: {
+      groups: [
+        {
+          name: "Gemini Models",
+          buckets: [
+            {
+              id: "gemini-weekly",
+              name: "Weekly Limit Remaining",
+              window: "weekly",
+              remaining_fraction: 0.9126,
+              reset_time: "2026-11-30T15:19:00Z",
+            },
+            {
+              id: "gemini-5h",
+              name: "Five Hour Limit Remaining",
+              window: "5h",
+              remaining_fraction: 0.9589,
+              reset_time: "2026-11-24T21:17:00Z",
+            },
+          ],
+        },
+        {
+          name: "Claude and GPT models",
+          buckets: [
+            {
+              id: "3p-weekly",
+              name: "Weekly Limit Remaining",
+              window: "weekly",
+              remaining_fraction: 1,
+              reset_time: "2026-11-29T12:54:00Z",
+            },
+            {
+              id: "3p-5h",
+              name: "Five Hour Limit Remaining",
+              window: "5h",
+              remaining_fraction: 1,
+              reset_time: "2026-11-24T22:00:00Z",
+            },
+          ],
+        },
+      ],
+    },
+  },
+});
 
-const SECOND_ACCOUNT_CLI_OUTPUT = [
-  "\x1b[2J\x1b[1;1HModels & Quota  Account: second@example.com",
-  "",
-  "GEMINI MODELS",
-  "  Five Hour Limit Remaining",
-  "    [████████████████████░░░░░░░░░░░░░░░░░░░░] 50.00%",
-  "    Refreshes in 2h 0m",
-].join("\n");
+const SECOND_ACCOUNT_CLI_JSON = JSON.stringify({
+  conversation_id: "",
+  status: "SUCCESS",
+  response: "",
+  command: {
+    name: "usage",
+    data: {
+      groups: [
+        {
+          name: "Gemini Models",
+          buckets: [
+            {
+              id: "gemini-5h",
+              name: "Five Hour Limit Remaining",
+              window: "5h",
+              remaining_fraction: 0.5,
+              reset_time: "2026-11-24T19:00:00Z",
+            },
+          ],
+        },
+      ],
+    },
+  },
+});
 
 const isoAt = (epochMs: number) => DateTime.formatIso(DateTime.makeUnsafe(epochMs));
 
+const tokenFile = (email: string) =>
+  JSON.stringify({
+    token: {
+      access_token: "access",
+      token_type: "Bearer",
+      refresh_token: "refresh",
+      expiry: "2026-11-24T18:00:00+08:00",
+      expires_in: 3599,
+    },
+    auth_method: "consumer",
+    id_token_email: email,
+  });
+
 const createProfileWithCliToken = Effect.fn("AntigravityUsageTest.createProfileWithCliToken")(
-  function* () {
+  function* (email = "user@example.com") {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const profileDirectory = yield* fs.makeTempDirectoryScoped();
     yield* fs.makeDirectory(path.join(profileDirectory, "antigravity-acp"));
     yield* fs.writeFileString(
       path.join(profileDirectory, "antigravity-acp", "antigravity-oauth-token"),
-      "{}",
+      tokenFile(email),
     );
     return profileDirectory;
   },
 );
 
+const profileTokenPath = (path: Path.Path, profileDirectory: string) =>
+  path.join(profileDirectory, "antigravity-acp", "antigravity-oauth-token");
+
 describe("parseAntigravityCliUsageOutput", () => {
-  it("parses Gemini and 3P groups, ordering 5-hour before Weekly and computing reset timestamps", () => {
-    const nowMs = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-24T17:00:00.000Z"));
-    const parsed = parseAntigravityCliUsageOutput(SAMPLE_CLI_OUTPUT, nowMs);
+  it("parses official JSON groups, ordering 5-hour before Weekly and mapping remaining fractions", () => {
+    const parsed = parseAntigravityCliUsageOutput(SAMPLE_CLI_JSON);
     expect(parsed).toBeDefined();
-    expect(parsed?.accountEmail).toBe("user@example.com");
     expect(parsed?.windows).toEqual([
       {
         id: "gemini-5h",
         label: "Gemini · 5-hour",
         kind: "session",
-        usedPercent: 4.11,
+        usedPercent: (1 - 0.9589) * 100,
         windowDurationMins: 300,
-        resetsAt: isoAt(nowMs + (4 * 60 + 17) * 60_000),
+        resetsAt: "2026-11-24T21:17:00.000Z",
       },
       {
         id: "gemini-weekly",
         label: "Gemini · Weekly",
         kind: "weekly",
-        usedPercent: 8.74,
+        usedPercent: (1 - 0.9126) * 100,
         windowDurationMins: 10080,
-        resetsAt: isoAt(nowMs + (156 * 60 + 19) * 60_000),
+        resetsAt: "2026-11-30T15:19:00.000Z",
       },
       {
         id: "3p-5h",
@@ -103,6 +155,7 @@ describe("parseAntigravityCliUsageOutput", () => {
         kind: "session",
         usedPercent: 0,
         windowDurationMins: 300,
+        resetsAt: "2026-11-24T22:00:00.000Z",
       },
       {
         id: "3p-weekly",
@@ -110,63 +163,69 @@ describe("parseAntigravityCliUsageOutput", () => {
         kind: "weekly",
         usedPercent: 0,
         windowDurationMins: 10080,
-        resetsAt: isoAt(nowMs + (117 * 60 + 54) * 60_000),
+        resetsAt: "2026-11-29T12:54:00.000Z",
       },
     ]);
   });
 
-  it("resolves cursor-positioned in-place percentage overwrites without repeating Models & Quota", () => {
-    const nowMs = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-24T17:00:00.000Z"));
-    const inPlaceRedraw =
-      "\x1b[2J\x1b[1;1HModels & Quota  Account: user@example.com" +
-      "\x1b[3;1HGEMINI MODELS" +
-      "\x1b[5;1HFive Hour Limit Remaining" +
-      "\x1b[6;1H[████] 95.00%" +
-      "\x1b[7;1HRefreshes in 1d 2h" +
-      "\x1b[6;8H50.00%\x1b[K";
-    const parsed = parseAntigravityCliUsageOutput(inPlaceRedraw, nowMs);
+  it("skips disabled and duplicate buckets", () => {
+    const parsed = parseAntigravityCliUsageOutput(
+      JSON.stringify({
+        status: "SUCCESS",
+        command: {
+          data: {
+            groups: [
+              {
+                buckets: [
+                  { id: "gemini-weekly", window: "weekly", remaining_fraction: 0.5 },
+                  { id: "gemini-weekly", window: "weekly", remaining_fraction: 0.1 },
+                  { id: "gemini-5h", window: "5h", remaining_fraction: 0.2, disabled: true },
+                ],
+              },
+            ],
+          },
+        },
+      }),
+    );
     expect(parsed?.windows).toEqual([
       {
-        id: "gemini-5h",
-        label: "Gemini · 5-hour",
-        kind: "session",
+        id: "gemini-weekly",
+        label: "Gemini · Weekly",
+        kind: "weekly",
         usedPercent: 50,
-        windowDurationMins: 300,
-        resetsAt: isoAt(nowMs + 26 * 3_600_000),
+        windowDurationMins: 10080,
       },
     ]);
   });
 
-  it("clamps extreme CSI CUP and CHA column parameters so screen memory stays bounded", () => {
-    const nowMs = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-24T17:00:00.000Z"));
-    const hostile =
-      "\x1b[1;99999999HX\x1b[99999999GY" +
-      "\x1b[2J\x1b[1;1HModels & Quota  Account: user@example.com" +
-      "\x1b[3;1HGEMINI MODELS\x1b[5;1HFive Hour Limit Remaining\x1b[6;1H[████] 75.00%";
-    const parsed = parseAntigravityCliUsageOutput(hostile, nowMs);
-    expect(parsed?.windows).toHaveLength(1);
-    expect(parsed?.windows[0]?.usedPercent).toBe(25);
-  });
-
-  it("returns undefined when output has no quota groups", () => {
-    const nowMs = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-24T17:00:00.000Z"));
-    expect(parseAntigravityCliUsageOutput("Antigravity CLI 1.5.16", nowMs)).toBeUndefined();
+  it("returns undefined for error statuses, unparseable output, and empty reports", () => {
+    expect(
+      parseAntigravityCliUsageOutput(
+        JSON.stringify({ status: "ERROR", error: "authentication failed or timed out" }),
+      ),
+    ).toBeUndefined();
+    expect(parseAntigravityCliUsageOutput("Antigravity CLI 1.5.17")).toBeUndefined();
+    expect(
+      parseAntigravityCliUsageOutput(JSON.stringify({ status: "SUCCESS", command: { data: {} } })),
+    ).toBeUndefined();
   });
 });
 
-describe("antigravityAccountFingerprint / antigravityEmailFingerprint", () => {
-  it.effect("matches local CLI email fingerprint when hub userinfo provides email", () =>
+describe("antigravityEmailFingerprint / antigravityTokenEmail", () => {
+  it.effect("normalizes email casing and whitespace into a stable fingerprint", () =>
     Effect.gen(function* () {
-      const cliFp = yield* antigravityEmailFingerprint("user@example.com");
-      const hubFp = yield* antigravityAccountFingerprint({
-        id: "google-42",
-        email: " User@Example.com ",
-      });
-      const idOnlyFp = yield* antigravityAccountFingerprint({ id: "google-42" });
-      expect(hubFp).toBe(cliFp);
-      expect(idOnlyFp).toBe("136d4952771fd67a3600053f37492cbd05828712e0b1c89ebab03d4c22ab6554");
+      const fingerprint = yield* antigravityEmailFingerprint(" User@Example.com ");
+      const same = yield* antigravityEmailFingerprint("user@example.com");
+      expect(fingerprint).toBe(same);
     }).pipe(Effect.provide(NodeCrypto.layer)),
   );
+
+  it("reads the signed-in account from the profile token file without touching the keyring", () => {
+    expect(antigravityTokenEmail(tokenFile("user@example.com"))).toBe("user@example.com");
+    expect(antigravityTokenEmail("not json")).toBeUndefined();
+    expect(antigravityTokenEmail(undefined)).toBeUndefined();
+    expect(antigravityTokenEmail(JSON.stringify({ token: {} }))).toBeUndefined();
+  });
 });
 
 describe("buildAntigravityCliUsageEnv", () => {
@@ -206,162 +265,9 @@ describe("buildAntigravityCliUsageEnv", () => {
   });
 });
 
-describe("runOfficialAgyUsagePty", () => {
-  it.effect(
-    "waits for banner, sends /usage, captures quota output, and awaits exit on teardown",
-    () =>
-      Effect.gen(function* () {
-        const writes: string[] = [];
-        let killed = false;
-        let exitedReported = false;
-        let onDataHandler: ((chunk: string) => void) | undefined;
-        let onExitHandler: (() => void) | undefined;
-
-        const fakePtyModule: AntigravityNodePtyModule = {
-          spawn: () =>
-            ({
-              onData: (cb: (chunk: string) => void) => {
-                onDataHandler = cb;
-                queueMicrotask(() => cb("Antigravity CLI 1.5.16\n"));
-                return { dispose: () => {} };
-              },
-              onExit: (cb: () => void) => {
-                onExitHandler = cb;
-                return { dispose: () => {} };
-              },
-              write: (data: string) => {
-                writes.push(data);
-                if (data === "\r") {
-                  queueMicrotask(() => onDataHandler?.(SAMPLE_CLI_OUTPUT));
-                }
-              },
-              kill: () => {
-                killed = true;
-                queueMicrotask(() => {
-                  exitedReported = true;
-                  onExitHandler?.();
-                });
-              },
-            }) as unknown as ReturnType<AntigravityNodePtyModule["spawn"]>,
-        };
-
-        const fiber = yield* runOfficialAgyUsagePty(
-          {
-            executablePath: "/usr/local/bin/agy",
-            env: { PATH: "/usr/local/bin" },
-            cwd: "/tmp",
-          },
-          () => fakePtyModule,
-        ).pipe(Effect.scoped, Effect.forkChild);
-
-        yield* TestClock.adjust("5 seconds");
-        const output = yield* Fiber.join(fiber);
-        expect(output).toContain("Models & Quota");
-        expect(writes).toEqual(["/usage", "\r", "\x1b", "\x03\x03"]);
-        expect(killed).toBe(true);
-        expect(exitedReported).toBe(true);
-      }),
-  );
-
-  it.effect("completes a single-window quota summary promptly within the outer probe timeout", () =>
-    Effect.gen(function* () {
-      let onDataHandler: ((chunk: string) => void) | undefined;
-      let onExitHandler: (() => void) | undefined;
-      const fakePtyModule: AntigravityNodePtyModule = {
-        spawn: () =>
-          ({
-            onData: (cb: (chunk: string) => void) => {
-              onDataHandler = cb;
-              queueMicrotask(() => cb("Antigravity CLI 1.5.16\n"));
-              return { dispose: () => {} };
-            },
-            onExit: (cb: () => void) => {
-              onExitHandler = cb;
-              return { dispose: () => {} };
-            },
-            write: (data: string) => {
-              if (data === "\r") {
-                queueMicrotask(() => onDataHandler?.(SECOND_ACCOUNT_CLI_OUTPUT));
-              }
-            },
-            kill: () => {
-              queueMicrotask(() => onExitHandler?.());
-            },
-          }) as unknown as ReturnType<AntigravityNodePtyModule["spawn"]>,
-      };
-
-      const fiber = yield* runOfficialAgyUsagePty(
-        {
-          executablePath: "/usr/local/bin/agy",
-          env: { PATH: "/usr/local/bin" },
-          cwd: "/tmp",
-        },
-        () => fakePtyModule,
-      ).pipe(Effect.scoped, Effect.forkChild);
-
-      yield* TestClock.adjust("6 seconds");
-      const output = yield* Fiber.join(fiber);
-      const parsed = parseAntigravityCliUsageOutput(output, 0);
-      expect(parsed?.windows).toHaveLength(1);
-      expect(parsed?.windows[0]?.usedPercent).toBe(50);
-    }),
-  );
-
-  it.effect(
-    "aborts with AntigravityCliUsageError(output_limit_exceeded) even if a valid frame preceded the overflow",
-    () =>
-      Effect.gen(function* () {
-        let killed = false;
-        let onDataHandler: ((chunk: string) => void) | undefined;
-        let onExitHandler: (() => void) | undefined;
-        const fakePtyModule: AntigravityNodePtyModule = {
-          spawn: () =>
-            ({
-              onData: (cb: (chunk: string) => void) => {
-                onDataHandler = cb;
-                queueMicrotask(() => cb("Antigravity CLI 1.5.16\n"));
-                return { dispose: () => {} };
-              },
-              onExit: (cb: () => void) => {
-                onExitHandler = cb;
-                return { dispose: () => {} };
-              },
-              write: (data: string) => {
-                if (data === "\r") {
-                  queueMicrotask(() => {
-                    onDataHandler?.(SAMPLE_CLI_OUTPUT);
-                    onDataHandler?.("x".repeat(300 * 1024));
-                  });
-                }
-              },
-              kill: () => {
-                killed = true;
-                queueMicrotask(() => onExitHandler?.());
-              },
-            }) as unknown as ReturnType<AntigravityNodePtyModule["spawn"]>,
-        };
-
-        const fiber = yield* runOfficialAgyUsagePty(
-          {
-            executablePath: "/usr/local/bin/agy",
-            env: { PATH: "/usr/local/bin" },
-            cwd: "/tmp",
-          },
-          () => fakePtyModule,
-        ).pipe(Effect.scoped, Effect.flip, Effect.forkChild);
-
-        yield* TestClock.adjust("5 seconds");
-        const error = yield* Fiber.join(fiber);
-        expect(error).toBeInstanceOf(AntigravityCliUsageError);
-        expect(error.reason).toBe("output_limit_exceeded");
-        expect(killed).toBe(true);
-      }),
-  );
-});
-
 describe("makeAntigravityUsageProbe (official CLI)", () => {
   it.effect(
-    "caches for 5m while preserving original checkedAt, isolates HOME/GEMINI_HOME with empty MCP/hooks, and holds executable lease",
+    "caches for 5m while preserving checkedAt, isolates HOME with empty MCP/hooks, forces file token storage, and holds the executable lease",
     () =>
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
@@ -401,7 +307,14 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
                 .pipe(Effect.orElseSucceed(() => ""));
               expect(mcpConfig).toBe('{"mcpServers":{}}');
               expect(hooksConfig).toBe("{}");
-              return SAMPLE_CLI_OUTPUT;
+              // The profile's own token is copied into the isolated home; the keyring is untouched.
+              const isolatedToken = yield* fs
+                .readFileString(
+                  path.join(isolatedGemini, "antigravity-cli", "antigravity-oauth-token"),
+                )
+                .pipe(Effect.orElseSucceed(() => ""));
+              expect(antigravityTokenEmail(isolatedToken)).toBe("user@example.com");
+              return SAMPLE_CLI_JSON;
             }),
         });
 
@@ -414,8 +327,10 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
         expect(invocations[0]?.env.ELECTRON_RUN_AS_NODE).toBeUndefined();
         expect(invocations[0]?.env.GEMINI_API_KEY).toBeUndefined();
         expect(invocations[0]?.env.AGY_ADC_AUTH).toBeUndefined();
+        expect(invocations[0]?.env.AGY_CLI_FORCE_FILE_TOKEN_STORAGE).toBe("1");
         expect(invocations[0]?.env.HOME).toBe(invocations[0]?.cwd);
         expect(invocations[0]?.env.GEMINI_HOME).not.toBe(profileDirectory);
+        expect(invocations[0]?.args).toEqual(["-p", "/usage", "--output-format", "json"]);
         expect(first.unavailable).toBeUndefined();
         expect(first.windows).toHaveLength(4);
         expect(first.credentialFingerprint).toBe(expectedFingerprint);
@@ -435,6 +350,40 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
       }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
+  it.effect("writes a token refreshed by the CLI back to the profile", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const profileDirectory = yield* createProfileWithCliToken("before@example.com");
+      let ran = 0;
+
+      const usage = yield* makeAntigravityUsageProbe({
+        profileDirectory,
+        authMethod: "oauth-personal",
+        runCliUsage: (args) =>
+          Effect.gen(function* () {
+            ran++;
+            const tokenPath = path.join(
+              args.cwd,
+              ".gemini",
+              "antigravity-cli",
+              "antigravity-oauth-token",
+            );
+            yield* fs.writeFileString(tokenPath, tokenFile("after@example.com"));
+            return SAMPLE_CLI_JSON;
+          }),
+      });
+
+      const limits = yield* usage.probe;
+      expect(ran).toBe(1);
+      const stored = yield* fs.readFileString(profileTokenPath(path, profileDirectory));
+      expect(antigravityTokenEmail(stored)).toBe("after@example.com");
+      expect(limits.credentialFingerprint).toBe(
+        yield* antigravityEmailFingerprint("after@example.com"),
+      );
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
   it.effect("deduplicates concurrent probe calls so only one CLI process runs", () =>
     Effect.gen(function* () {
       const startMs = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-24T17:00:00Z"));
@@ -450,7 +399,7 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
           Effect.gen(function* () {
             calls++;
             yield* Deferred.await(gate);
-            return SAMPLE_CLI_OUTPUT;
+            return SAMPLE_CLI_JSON;
           }),
       });
 
@@ -482,25 +431,36 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
           gcpLocation: "us-central1",
           runCliUsage: (args) => {
             invocations.push(args);
-            return Effect.succeed(SAMPLE_CLI_OUTPUT);
+            return Effect.succeed(SAMPLE_CLI_JSON);
           },
         });
 
         const limits = yield* usage.probe;
         expect(limits.unavailable).toBeUndefined();
         expect(invocations).toHaveLength(1);
-        expect(invocations[0]?.args).toEqual(["--project", "enterprise-proj"]);
+        expect(invocations[0]?.args).toEqual([
+          "-p",
+          "/usage",
+          "--output-format",
+          "json",
+          "--project",
+          "enterprise-proj",
+        ]);
         expect(invocations[0]?.env.GOOGLE_CLOUD_PROJECT).toBe("enterprise-proj");
         expect(invocations[0]?.env.GOOGLE_CLOUD_LOCATION).toBe("us-central1");
+        // Enterprise accounts keep OS-keyring sign-ins, so file storage is not forced there.
+        expect(invocations[0]?.env.AGY_CLI_FORCE_FILE_TOKEN_STORAGE).toBeUndefined();
       }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.effect("discards cached quota immediately on clear() when switching accounts", () =>
     Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
       const startMs = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-24T17:00:00Z"));
       yield* TestClock.setTime(startMs);
-      const profileDirectory = yield* createProfileWithCliToken();
-      let currentOutput = SAMPLE_CLI_OUTPUT;
+      const profileDirectory = yield* createProfileWithCliToken("first@example.com");
+      let currentOutput = SAMPLE_CLI_JSON;
       let calls = 0;
 
       const usage = yield* makeAntigravityUsageProbe({
@@ -516,7 +476,11 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
       expect(calls).toBe(1);
 
       yield* TestClock.adjust("20 seconds");
-      currentOutput = SECOND_ACCOUNT_CLI_OUTPUT;
+      currentOutput = SECOND_ACCOUNT_CLI_JSON;
+      yield* fs.writeFileString(
+        profileTokenPath(path, profileDirectory),
+        tokenFile("second@example.com"),
+      );
       yield* usage.clear;
 
       const accountB = yield* usage.probe;
@@ -570,7 +534,7 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
         ),
         runCliUsage: () => {
           calls++;
-          return Effect.succeed(SAMPLE_CLI_OUTPUT);
+          return Effect.succeed(SAMPLE_CLI_JSON);
         },
       });
 
@@ -593,7 +557,7 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
           authMethod: "oauth-personal",
           runCliUsage: () => {
             calls++;
-            return Effect.succeed(SAMPLE_CLI_OUTPUT);
+            return Effect.succeed(SAMPLE_CLI_JSON);
           },
         });
 
@@ -615,7 +579,7 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
         authMethod: "gemini-api-key",
         runCliUsage: () => {
           calls++;
-          return Effect.succeed(SAMPLE_CLI_OUTPUT);
+          return Effect.succeed(SAMPLE_CLI_JSON);
         },
       });
 
@@ -624,46 +588,5 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
       expect(limits.unavailable?.reason).toBe("unsupported");
       expect(limits.windows).toEqual([]);
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-});
-
-describe("antigravitySummaryWindows (CLIProxyAPI hub helper)", () => {
-  it.effect("omits rolling resets for untouched summary buckets and keeps used Gemini resets", () =>
-    Effect.gen(function* () {
-      const requestedAt = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-21T10:16:04Z"));
-      const windows = yield* antigravitySummaryWindows(
-        {
-          groups: [
-            {
-              buckets: [
-                {
-                  bucketId: "3p-5h",
-                  window: "5h",
-                  remainingFraction: 1,
-                  resetTime: "2026-10-21T15:16:05Z",
-                },
-                {
-                  bucketId: "gemini-5h",
-                  window: "5h",
-                  remainingFraction: 0.85,
-                  resetTime: "2026-10-21T13:29:53Z",
-                  description: "Used some of your 5-hour limit.",
-                },
-              ],
-            },
-          ],
-        },
-        requestedAt,
-      );
-      const byId = new Map(windows.map((window) => [window.id, window]));
-      expect(byId.get("3p-5h")).toEqual({
-        id: "3p-5h",
-        label: "Claude & GPT (shared) · 5-hour",
-        kind: "session",
-        usedPercent: 0,
-        windowDurationMins: 300,
-      });
-      expect(byId.get("gemini-5h")?.resetsAt).toBe("2026-10-21T13:29:53.000Z");
-    }),
   );
 });
