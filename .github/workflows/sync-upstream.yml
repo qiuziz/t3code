@@ -1,16 +1,26 @@
 name: Sync upstream
 
-# Merges pingdotgg/t3code main into this fork once a day. A clean merge pushes to
-# main and starts Build custom desktop; conflicts stop here for a manual fix.
+# Tracks upstream *stable* releases only (non-prerelease tags such as v0.1.11).
+# Nightly builds move several times a day; syncing them churns the fork and multiplies conflicts.
+#
+# Flow: no conflict -> pull request -> merge -> dispatch the desktop build.
+#       conflict    -> open an "upstream-conflict" issue; the T3 webhook turns it into a thread.
 
 on:
   schedule:
     # 20:00 UTC is 04:00 Asia/Shanghai.
     - cron: "0 20 * * *"
   workflow_dispatch:
+    inputs:
+      target:
+        description: "Upstream tag to sync (default: latest stable release)"
+        type: string
+        default: ""
 
 permissions:
   contents: write
+  pull-requests: write
+  issues: write
   actions: write
 
 concurrency:
@@ -18,8 +28,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  merge:
-    name: Merge upstream main
+  sync:
+    name: Sync stable upstream release
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -29,31 +39,118 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Merge upstream main
-        id: merge
+      - name: Resolve target release
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.target }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/pingdotgg/t3code.git
-          git fetch --no-tags upstream main
-          if git merge-base --is-ancestor upstream/main HEAD; then
-            echo "Already up to date with upstream/main."
-            echo "merged=false" >> "$GITHUB_OUTPUT"
+
+          if [[ -n "${REQUESTED}" ]]; then
+            target="${REQUESTED}"
+          else
+            # Latest non-prerelease release; nightlies are ignored on purpose.
+            target="$(gh release list --repo pingdotgg/t3code --limit 100 \
+              --json tagName,isPrerelease,publishedAt \
+              --jq '[.[]|select(.isPrerelease==false)]|sort_by(.publishedAt)|last|.tagName')"
+          fi
+
+          if [[ -z "${target}" || "${target}" == "null" ]]; then
+            echo "::notice::No stable upstream release found; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if ! git merge --no-edit upstream/main; then
-            git merge --abort
-            echo "::error::Upstream merge conflicts with this fork; merge it locally and push the resolution."
-            exit 1
-          fi
-          git push origin main
-          echo "merged=true" >> "$GITHUB_OUTPUT"
 
-      # A push made with GITHUB_TOKEN does not start other workflows, so start the
-      # desktop build explicitly after a merge lands.
+          git fetch --no-tags upstream "refs/tags/${target}:refs/tags/${target}"
+          sha="$(git rev-parse "${target}^{commit}")"
+          echo "target=${target}" >> "$GITHUB_OUTPUT"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "${sha}" HEAD; then
+            echo "::notice::${target} (${sha:0:8}) is already in main; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge release on a sync branch
+        id: merge
+        if: steps.target.outputs.skip == 'false'
+        env:
+          TARGET: ${{ steps.target.outputs.target }}
+        run: |
+          set -euo pipefail
+          branch="sync/upstream-${TARGET}"
+          git switch -c "${branch}"
+          if git merge --no-edit "${TARGET}"; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+            git push origin "${branch}"
+          else
+            git diff --name-only --diff-filter=U | sort > /tmp/conflicts.txt
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open and merge the sync pull request
+        if: steps.merge.outputs.conflict == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ steps.target.outputs.target }}
+          BRANCH: ${{ steps.merge.outputs.branch }}
+        run: |
+          set -euo pipefail
+          body="$(printf 'Upstream stable release `%s` merged into the fork.\n\n- Tag: `%s`\n- Commit: `%s`\n- Workflow run: %s\n' \
+            "$TARGET" "$TARGET" "${{ steps.target.outputs.sha }}" \
+            "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")"
+          gh pr create --repo "${{ github.repository }}" --base main --head "$BRANCH" \
+            --title "chore(sync): upstream ${TARGET}" --body "$body" >/dev/null
+          gh pr merge --repo "${{ github.repository }}" --merge --delete-branch "$BRANCH"
+
+      # A push made with GITHUB_TOKEN does not start other workflows, so ask for the build explicitly.
       - name: Trigger custom desktop build
-        if: steps.merge.outputs.merged == 'true'
+        if: steps.merge.outputs.conflict == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run build-custom-desktop.yml --ref main
+
+      - name: Open a conflict issue
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ steps.target.outputs.target }}
+        run: |
+          set -euo pipefail
+          conflicts="$(sed 's/^/- `/' /tmp/conflicts.txt | sed 's/$/`/')"
+          day="$(date -u +%Y-%m-%d)"
+          body="$(cat <<EOF
+          Syncing upstream stable \`${TARGET}\` into \`main\` hit conflicts. CI stopped and did not merge anything.
+
+          - Target tag: \`${TARGET}\`
+          - Target commit: \`${{ steps.target.outputs.sha }}\`
+          - Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          ## Conflicted files
+
+          ${conflicts}
+
+          ## Decision template (see docs/desktop-build-and-release.md §6.1)
+
+          \`\`\`
+          冲突：<file>:<line>
+          上游意图：<one line + snippet>
+          fork 意图：<one line + snippet>
+          影响：<keep upstream vs keep fork>
+          建议：A) ... B) ...
+          \`\`\`
+          EOF
+          )"
+          gh issue create --repo "${{ github.repository }}" \
+            --title "[upstream-conflict] ${TARGET} ${day}" \
+            --label upstream-conflict \
+            --body "${body}"
