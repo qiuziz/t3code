@@ -61,6 +61,7 @@ import {
 } from "@t3tools/provider-core/server/adapterDriver";
 import {
   AcpProviderCapabilitiesV2,
+  AcpSteerDeclined,
   makeAcpAdapterV2,
   type AcpAdapterV2ExtensionContext,
   type AcpAdapterV2Flavor,
@@ -76,22 +77,21 @@ const isAcpRequestError = Schema.is(EffectAcpErrors.AcpRequestError);
 /** Local-install CodeBuddy (`cbc --acp`) and its registry id. */
 export function isCodeBuddyAgent(settings: AcpRegistrySettings): boolean {
   if (settings.source !== "local") return settings.agentId === "codebuddy";
-  return /^(?:cbc|codebuddy)(\.exe|\.cmd)?$/i.test(
-    settings.commandPath.split(/[\\/]/).pop() ?? "",
-  );
+  return /^(?:cbc|codebuddy)(\.exe|\.cmd)?$/i.test(settings.commandPath.split(/[\\/]/).pop() ?? "");
 }
 
 /**
  * CodeBuddy's non-standard `session/steer`: it buffers the message into the running
  * turn and answers `{ steered, ownerRequestId }`. A false reply (idle turn, or content
- * it will not inject) fails so the orchestrator queues the message as a follow-up.
+ * it will not inject) raises `AcpSteerDeclined`, which the ACP adapter turns into
+ * `ProviderAdapterSteerDeclinedError` so the orchestrator queues the message as a follow-up.
  */
 export const sendCodeBuddySteer = (
   runtime: AcpSessionRuntime.AcpSessionRuntime["Service"],
   sessionId: string,
   text: string,
   images: ReadonlyArray<EffectAcpSchema.ContentBlock>,
-): Effect.Effect<string | undefined, EffectAcpErrors.AcpError> =>
+): Effect.Effect<string | undefined, EffectAcpErrors.AcpError | AcpSteerDeclined> =>
   runtime
     .request("session/steer", {
       sessionId,
@@ -105,10 +105,8 @@ export const sendCodeBuddySteer = (
             : undefined;
         if (steered === false) {
           return Effect.fail(
-            new EffectAcpErrors.AcpTransportError({
-              method: "session/steer",
+            new AcpSteerDeclined({
               detail: "CodeBuddy declined the steering message",
-              cause: result,
             }),
           );
         }

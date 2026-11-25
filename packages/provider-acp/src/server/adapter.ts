@@ -26,6 +26,7 @@ import {
   type ProviderDriverKind,
   type ProviderRequestKind,
   type ProviderThreadId,
+  type ProviderTurnId,
   type ProviderUserInputAnswers,
   type RuntimeMode,
   type RuntimeRequestId,
@@ -343,6 +344,49 @@ class AcpModelSelectionError extends Schema.TaggedError<AcpModelSelectionError>(
 }
 
 const isAcpModelSelectionError = Schema.is(AcpModelSelectionError);
+
+/**
+ * A native steer the agent refused (it will not inject the message). The adapter turns this into
+ * `ProviderAdapterSteerDeclinedError` so the orchestrator queues the message as a follow-up.
+ */
+export class AcpSteerDeclined extends Schema.TaggedError<AcpSteerDeclined>()("AcpSteerDeclined", {
+  detail: Schema.optional(Schema.String),
+}) {
+  override get message(): string {
+    return this.detail ?? "The agent declined the steering message.";
+  }
+}
+
+const isProviderAdapterSteerDeclinedError = Schema.is(
+  ProviderAdapter.ProviderAdapterSteerDeclinedError,
+);
+const isProviderAdapterSteerRunUnsupportedError = Schema.is(
+  ProviderAdapter.ProviderAdapterSteerRunUnsupportedError,
+);
+
+/**
+ * Keeps `unsupported` and `declined` as themselves — the orchestrator turns `declined` into a
+ * queued follow-up — and folds every other failure into `ProviderAdapterSteerRunError`.
+ */
+export const acpSteerTurnError = (input: {
+  readonly driver: ProviderDriverKind;
+  readonly providerThreadId: ProviderThreadId;
+  readonly providerTurnId: ProviderTurnId;
+  readonly cause: unknown;
+}):
+  | ProviderAdapter.ProviderAdapterSteerRunUnsupportedError
+  | ProviderAdapter.ProviderAdapterSteerDeclinedError
+  | ProviderAdapter.ProviderAdapterSteerRunError =>
+  isProviderAdapterSteerRunUnsupportedError(input.cause)
+    ? input.cause
+    : isProviderAdapterSteerDeclinedError(input.cause)
+      ? input.cause
+      : new ProviderAdapter.ProviderAdapterSteerRunError({
+          driver: input.driver,
+          providerThreadId: input.providerThreadId,
+          providerTurnId: input.providerTurnId,
+          cause: input.cause,
+        });
 const isProviderCompactionUnsupportedError = Schema.is(
   ProviderAdapter.ProviderCompactionUnsupportedError,
 );
@@ -603,12 +647,13 @@ export interface AcpAdapterV2Flavor {
    * No id means the running turn reads the message once the agent accepts it.
    */
   readonly steering?: {
+    /** `AcpSteerDeclined` when the agent refuses the message; the orchestrator then queues it. */
     readonly send: (
       runtime: AcpSessionRuntime.AcpSessionRuntime["Service"],
       sessionId: string,
       text: string,
       images: ReadonlyArray<EffectAcpSchema.ContentBlock>,
-    ) => Effect.Effect<string | undefined, EffectAcpErrors.AcpError>;
+    ) => Effect.Effect<string | undefined, EffectAcpErrors.AcpError | AcpSteerDeclined>;
     readonly injectedSteerId?: (
       notification: EffectAcpSchema.SessionNotification,
     ) => string | undefined;
@@ -10601,12 +10646,20 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     : appContextEntries.map(formatAcpAppContextEntry).join("\n");
               const appContextSequence =
                 appContextEntries.length === 0 ? 0 : ++context.appContextSequence;
-              const steerId = yield* steering.send(
-                runtime,
-                context.nativeThreadId,
-                steerText,
-                images,
-              );
+              const steerId = yield* steering
+                .send(runtime, context.nativeThreadId, steerText, images)
+                .pipe(
+                  Effect.catchTags({
+                    AcpSteerDeclined: () =>
+                      Effect.fail(
+                        new ProviderAdapter.ProviderAdapterSteerDeclinedError({
+                          driver,
+                          providerThreadId: turnInput.providerThread.id,
+                          providerTurnId: turnInput.providerTurnId,
+                        }),
+                      ),
+                  }),
+                );
               let steerConfirmed = true;
               if (steerId !== undefined) {
                 const injected = steerInjection(steerId);
@@ -10649,14 +10702,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             (effect, turnInput) =>
               effect.pipe(
                 Effect.mapError((cause) =>
-                  cause._tag === "ProviderAdapterSteerRunUnsupportedError"
-                    ? cause
-                    : new ProviderAdapter.ProviderAdapterSteerRunError({
-                        driver,
-                        providerThreadId: turnInput.providerThread.id,
-                        providerTurnId: turnInput.providerTurnId,
-                        cause,
-                      }),
+                  acpSteerTurnError({
+                    driver,
+                    providerThreadId: turnInput.providerThread.id,
+                    providerTurnId: turnInput.providerTurnId,
+                    cause,
+                  }),
                 ),
               ),
           ),

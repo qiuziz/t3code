@@ -66,13 +66,15 @@ describe("sendCodeBuddySteer", () => {
     }),
   );
 
-  it.effect("fails when CodeBuddy declines the steer so it queues as a follow-up", () =>
+  it.effect("raises AcpSteerDeclined when CodeBuddy declines the steer", () =>
     Effect.gen(function* () {
       const { runtime } = fakeRuntime({ steered: false, reason: "idle" });
 
       const error = yield* Effect.flip(sendCodeBuddySteer(runtime, "session-1", "stop", []));
 
-      expect(error._tag).toBe("AcpTransportError");
+      // The ACP adapter turns this tag into ProviderAdapterSteerDeclinedError, which is what
+      // makes EffectWorker queue the message as a follow-up instead of failing the turn.
+      expect(error._tag).toBe("AcpSteerDeclined");
     }),
   );
 });
