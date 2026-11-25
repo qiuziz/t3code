@@ -85,10 +85,19 @@ jobs:
         run: |
           set -euo pipefail
           branch="sync/upstream-${TARGET}"
+          # The delete below only ever targets this computed branch, and a malformed value
+          # must never reach a protected ref.
+          case "${branch}" in
+            sync/upstream-?*) ;;
+            *) echo "::error::unexpected sync branch name: ${branch}"; exit 1 ;;
+          esac
           git switch -c "${branch}"
           if git merge --no-edit "${TARGET}"; then
             echo "conflict=false" >> "$GITHUB_OUTPUT"
             echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+            # A previous run may have pushed this branch and then failed before merging the
+            # pull request; deleting it first keeps a rerun from failing on non-fast-forward.
+            git push origin --delete "${branch}" >/dev/null 2>&1 || true
             git push origin "${branch}"
           else
             git diff --name-only --diff-filter=U | sort > /tmp/conflicts.txt
@@ -152,7 +161,17 @@ jobs:
           \`\`\`
           EOF
           )"
-          gh issue create --repo "${{ github.repository }}" \
-            --title "[upstream-conflict] ${TARGET} ${day}" \
-            --label upstream-conflict \
-            --body "${body}"
+          # Keep one open issue per release: an unresolved conflict fails every daily run,
+          # and a new issue each time opens a duplicate T3 thread for the same decision.
+          # Prefix match, so release v0.1.1 never matches the issue for v0.1.11.
+          existing="$(gh issue list --repo "${{ github.repository }}" --state open \
+            --label upstream-conflict --limit 50 --json number,title \
+            --jq "[.[] | select(.title | startswith(\"[upstream-conflict] ${TARGET} \"))][0].number // empty")"
+          if [[ -n "${existing}" ]]; then
+            gh issue comment "${existing}" --repo "${{ github.repository }}" --body "${body}"
+          else
+            gh issue create --repo "${{ github.repository }}" \
+              --title "[upstream-conflict] ${TARGET} ${day}" \
+              --label upstream-conflict \
+              --body "${body}"
+          fi

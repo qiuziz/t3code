@@ -1,12 +1,15 @@
 name: Build custom desktop
 
-# Builds this fork's macOS (Apple Silicon) DMG on every push to main and on demand.
+# Builds this fork's macOS (Apple Silicon) DMG on demand and on pushes that touch the
+# desktop app itself. sync-upstream.yml dispatches this workflow explicitly after each
+# upstream release merge, so `paths` only filters direct pushes; it does not gate dispatch.
+# Workspace packages (apps/web, apps/server, packages/**) are intentionally absent: their
+# changes ship with the next release merge rather than triggering a build of their own.
 # The bundle is built once, then packaged; the DMG and a draft release are published.
 
 on:
   push:
     branches: [main]
-    # Avoid rebuilding on unrelated upstream sync commits; manual dispatch still builds any ref.
     paths:
       - ".github/workflows/build-custom-desktop.yml"
       - "apps/desktop/**"
@@ -24,8 +27,10 @@ on:
 permissions:
   contents: write
 
-# Do not cancel a queued macOS job when another run is requested — GitHub often
-# takes >10m to assign a hosted macOS runner; cancel-in-progress left billable_ms at 0.
+# Serialize builds instead of replacing them. A hosted macOS runner often takes >10m to
+# assign, and cancel-in-progress also cancelled runs that were still pending, leaving
+# billable_ms at 0. The trade-off is that a stuck run cannot be displaced by a newer push;
+# it holds the group until it finishes or hits the 90m timeout.
 concurrency:
   group: custom-desktop-${{ github.ref }}
   cancel-in-progress: false
