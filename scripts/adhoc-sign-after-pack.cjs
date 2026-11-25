@@ -1,4 +1,4 @@
-/* oxlint-disable t3code/no-global-process-runtime -- Packaging signs the built app for the macOS build host. */
+// Packaging signs the built app for the macOS build host.
 const { spawnSync } = require("node:child_process");
 const path = require("node:path");
 

@@ -43,6 +43,8 @@
         "setup-worktree.ts",
         "sign-macos.ts",
         "prepare-server-compile-cache.cjs",
+        // Loaded by electron-builder through a path string, like the two hooks above.
+        "adhoc-sign-after-pack.cjs",
         "smoke-desktop-app.ts",
         "verify-windows-desktop-artifact.ts",
       ],
