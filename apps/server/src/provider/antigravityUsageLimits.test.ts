@@ -1,157 +1,638 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import * as HostProcess from "@t3tools/shared/HostProcess";
-import * as Layer from "effect/Layer";
 import { describe, expect, it } from "@effect/vitest";
-import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as TestClock from "effect/testing/TestClock";
-import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/http";
 
 import {
-  decodeGoKeyringSecret,
+  AntigravityCliUsageError,
+  antigravityAccountFingerprint,
+  antigravityEmailFingerprint,
+  antigravitySummaryWindows,
+  buildAntigravityCliUsageEnv,
   makeAntigravityUsageProbe,
-  readWindowsCliCredential,
+  parseAntigravityCliUsageOutput,
+  runOfficialAgyUsagePty,
+  type AntigravityCliUsageRunInput,
+  type AntigravityNodePtyModule,
 } from "./antigravityUsageLimits.ts";
 
-const summary = {
-  groups: [
-    {
-      displayName: "Gemini Models",
-      buckets: [
-        {
-          bucketId: "gemini-weekly",
-          window: "weekly",
-          remainingFraction: 0.96,
-          resetTime: "2026-10-12T19:41:43Z",
-        },
-        {
-          bucketId: "gemini-5h",
-          window: "5h",
-          remainingFraction: 0.91,
-          resetTime: "2026-10-09T16:06:01Z",
-        },
-      ],
-    },
-    {
-      displayName: "Claude and GPT models",
-      buckets: [
-        {
-          bucketId: "3p-weekly",
-          window: "weekly",
-          remainingFraction: 0,
-          resetTime: "2026-10-10T15:28:22Z",
-        },
-        {
-          bucketId: "3p-5h",
-          window: "5h",
-          remainingFraction: 0.44,
-          resetTime: "2026-10-09T16:06:30Z",
-        },
-      ],
-    },
-  ],
-};
+const SAMPLE_CLI_OUTPUT = [
+  "\x1b[2J\x1b[1;1HModels & Quota  Account: user@example.com",
+  "",
+  "GEMINI MODELS",
+  "  Models within this group: Gemini 4 Neon, Gemini 4 Carbon",
+  "",
+  "  Weekly Limit Remaining",
+  "    [████████████████████████████████████░░] 91.26%",
+  "    Refreshes in 156h 19m",
+  "",
+  "  Five Hour Limit Remaining",
+  "    [██████████████████████████████████████░] 95.89%",
+  "    Refreshes in 4h 17m",
+  "",
+  "CLAUDE AND GPT MODELS",
+  "  Models within this group: Claude Sonnet 4.6, Claude Opus 4.6, GPT-OSS 120B",
+  "",
+  "  Weekly Limit Remaining",
+  "    [████████████████████████████████████████] 100.00%",
+  "    Refreshes in 117h 54m",
+  "",
+  "  Five Hour Limit Remaining",
+  "    [████████████████████████████████████████] 100.00%",
+  "    Quota available",
+].join("\n");
 
-const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
-  options: {
-    summary?: unknown;
-    /** Per-host quota summaries; hosts not listed fall back to `summary`. */
-    summaryByHost?: Record<string, unknown>;
-    models?: unknown;
-    summaryStatus?: number;
-    /** Per-host summary statuses; hosts not listed fall back to `summaryStatus`. */
-    summaryStatusByHost?: Record<string, number>;
-    tokenStatus?: number;
-    refreshToken?: string;
-    userId?: string;
-    userInfoAt?: number;
-    missingToken?: boolean;
-    authMethod?: "oauth-personal" | "oauth-business" | "gemini-api-key";
-    keyringSecret?: string;
-    /** Reads the OS keyring instead of `keyringSecret`. */
-    nativeKeyring?: boolean;
-  } = {},
-) {
-  const fs = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
-  const profileDirectory = yield* fs.makeTempDirectoryScoped();
-  yield* fs.makeDirectory(path.join(profileDirectory, "antigravity-acp"));
-  const tokenPath = path.join(profileDirectory, "antigravity-acp", "acp_token.json");
-  const writeToken = (refreshToken: string) =>
-    fs.writeFileString(
-      tokenPath,
-      JSON.stringify({
-        client_id: "client-id",
-        client_secret: "client-secret",
-        refresh_token: refreshToken,
-        project_id: "project-id",
-      }),
+const SECOND_ACCOUNT_CLI_OUTPUT = [
+  "\x1b[2J\x1b[1;1HModels & Quota  Account: second@example.com",
+  "",
+  "GEMINI MODELS",
+  "  Five Hour Limit Remaining",
+  "    [████████████████████░░░░░░░░░░░░░░░░░░░░] 50.00%",
+  "    Refreshes in 2h 0m",
+].join("\n");
+
+const isoAt = (epochMs: number) => DateTime.formatIso(DateTime.makeUnsafe(epochMs));
+
+const createProfileWithCliToken = Effect.fn("AntigravityUsageTest.createProfileWithCliToken")(
+  function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const profileDirectory = yield* fs.makeTempDirectoryScoped();
+    yield* fs.makeDirectory(path.join(profileDirectory, "antigravity-acp"));
+    yield* fs.writeFileString(
+      path.join(profileDirectory, "antigravity-acp", "antigravity-oauth-token"),
+      "{}",
     );
-  if (!options.missingToken) yield* writeToken(options.refreshToken ?? "refresh-a");
-  const requests: Array<{ url: string; body: string }> = [];
-  const http = HttpClient.make((request, url, _signal, fiber) =>
-    Effect.sync(() => {
-      const init = Context.getOrUndefined(fiber.context, FetchHttpClient.RequestInit);
-      expect(init?.redirect).toBe("manual");
-      const body =
-        request.body._tag === "Uint8Array" ? new TextDecoder().decode(request.body.body) : "";
-      requests.push({ url: request.url, body });
-      if (request.url.endsWith("/token")) {
-        expect(new URLSearchParams(body).get("grant_type")).toBe("refresh_token");
-        return HttpClientResponse.fromWeb(
-          request,
-          Response.json(
-            { access_token: "access-token", expires_in: 3600 },
-            { status: options.tokenStatus ?? 200 },
-          ),
-        );
-      }
-      expect(request.headers.authorization).toBe("Bearer access-token");
-      if (request.url.endsWith("/userinfo")) {
-        return HttpClientResponse.fromWeb(
-          request,
-          options.userId
-            ? Response.json({ id: options.userId, email: "someone@example.com" })
-            : Response.json({}, { status: 403 }),
-        );
-      }
-      expect(JSON.parse(body)).toEqual(options.missingToken ? {} : { project: "project-id" });
-      expect(request.headers["user-agent"]).toMatch(/^antigravity\/hub\/2\.24\.0 /);
-      return HttpClientResponse.fromWeb(
-        request,
-        request.url.endsWith(":retrieveUserQuotaSummary")
-          ? Response.json(options.summaryByHost?.[url.host] ?? options.summary ?? summary, {
-              status: options.summaryStatusByHost?.[url.host] ?? options.summaryStatus ?? 200,
-            })
-          : Response.json(options.models ?? { models: {} }),
-      );
-    }).pipe(
-      Effect.tap(() =>
-        request.url.endsWith("/userinfo") && options.userInfoAt !== undefined
-          ? TestClock.setTime(options.userInfoAt)
-          : Effect.void,
-      ),
-    ),
-  );
-  const usage = yield* makeAntigravityUsageProbe({
-    profileDirectory,
-    authMethod: options.authMethod ?? "oauth-personal",
-    ...(options.nativeKeyring ? {} : { readKeyringSecret: Effect.succeed(options.keyringSecret) }),
-  }).pipe(Effect.provideService(HttpClient.HttpClient, http));
-  return { ...usage, requests, writeToken, tokenPath };
+    return profileDirectory;
+  },
+);
+
+describe("parseAntigravityCliUsageOutput", () => {
+  it("parses Gemini and 3P groups, ordering 5-hour before Weekly and computing reset timestamps", () => {
+    const nowMs = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-24T17:00:00.000Z"));
+    const parsed = parseAntigravityCliUsageOutput(SAMPLE_CLI_OUTPUT, nowMs);
+    expect(parsed).toBeDefined();
+    expect(parsed?.accountEmail).toBe("user@example.com");
+    expect(parsed?.windows).toEqual([
+      {
+        id: "gemini-5h",
+        label: "Gemini · 5-hour",
+        kind: "session",
+        usedPercent: 4.11,
+        windowDurationMins: 300,
+        resetsAt: isoAt(nowMs + (4 * 60 + 17) * 60_000),
+      },
+      {
+        id: "gemini-weekly",
+        label: "Gemini · Weekly",
+        kind: "weekly",
+        usedPercent: 8.74,
+        windowDurationMins: 10080,
+        resetsAt: isoAt(nowMs + (156 * 60 + 19) * 60_000),
+      },
+      {
+        id: "3p-5h",
+        label: "Claude & GPT (shared) · 5-hour",
+        kind: "session",
+        usedPercent: 0,
+        windowDurationMins: 300,
+      },
+      {
+        id: "3p-weekly",
+        label: "Claude & GPT (shared) · Weekly",
+        kind: "weekly",
+        usedPercent: 0,
+        windowDurationMins: 10080,
+        resetsAt: isoAt(nowMs + (117 * 60 + 54) * 60_000),
+      },
+    ]);
+  });
+
+  it("resolves cursor-positioned in-place percentage overwrites without repeating Models & Quota", () => {
+    const nowMs = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-24T17:00:00.000Z"));
+    const inPlaceRedraw =
+      "\x1b[2J\x1b[1;1HModels & Quota  Account: user@example.com" +
+      "\x1b[3;1HGEMINI MODELS" +
+      "\x1b[5;1HFive Hour Limit Remaining" +
+      "\x1b[6;1H[████] 95.00%" +
+      "\x1b[7;1HRefreshes in 1d 2h" +
+      "\x1b[6;8H50.00%\x1b[K";
+    const parsed = parseAntigravityCliUsageOutput(inPlaceRedraw, nowMs);
+    expect(parsed?.windows).toEqual([
+      {
+        id: "gemini-5h",
+        label: "Gemini · 5-hour",
+        kind: "session",
+        usedPercent: 50,
+        windowDurationMins: 300,
+        resetsAt: isoAt(nowMs + 26 * 3_600_000),
+      },
+    ]);
+  });
+
+  it("clamps extreme CSI CUP and CHA column parameters so screen memory stays bounded", () => {
+    const nowMs = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-24T17:00:00.000Z"));
+    const hostile =
+      "\x1b[1;99999999HX\x1b[99999999GY" +
+      "\x1b[2J\x1b[1;1HModels & Quota  Account: user@example.com" +
+      "\x1b[3;1HGEMINI MODELS\x1b[5;1HFive Hour Limit Remaining\x1b[6;1H[████] 75.00%";
+    const parsed = parseAntigravityCliUsageOutput(hostile, nowMs);
+    expect(parsed?.windows).toHaveLength(1);
+    expect(parsed?.windows[0]?.usedPercent).toBe(25);
+  });
+
+  it("returns undefined when output has no quota groups", () => {
+    const nowMs = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-24T17:00:00.000Z"));
+    expect(parseAntigravityCliUsageOutput("Antigravity CLI 1.5.16", nowMs)).toBeUndefined();
+  });
 });
 
-describe("Antigravity subscription limits", () => {
-  // Oracle: the 10:16 UTC payload and its narrow Workaround rule.
+describe("antigravityAccountFingerprint / antigravityEmailFingerprint", () => {
+  it.effect("matches local CLI email fingerprint when hub userinfo provides email", () =>
+    Effect.gen(function* () {
+      const cliFp = yield* antigravityEmailFingerprint("user@example.com");
+      const hubFp = yield* antigravityAccountFingerprint({
+        id: "google-42",
+        email: " User@Example.com ",
+      });
+      const idOnlyFp = yield* antigravityAccountFingerprint({ id: "google-42" });
+      expect(hubFp).toBe(cliFp);
+      expect(idOnlyFp).toBe("136d4952771fd67a3600053f37492cbd05828712e0b1c89ebab03d4c22ab6554");
+    }).pipe(Effect.provide(NodeCrypto.layer)),
+  );
+});
+
+describe("buildAntigravityCliUsageEnv", () => {
+  it("strips ambient Google/ADC credentials and launcher internals case-insensitively", () => {
+    const cleaned = buildAntigravityCliUsageEnv(
+      {
+        PATH: "/usr/local/bin",
+        GEMINI_API_KEY: "ambient-gemini-key",
+        google_api_key: "ambient-google-key",
+        GOOGLE_APPLICATION_CREDENTIALS: "/tmp/creds.json",
+        GOOGLE_GENAI_USE_VERTEXAI: "true",
+        GOOGLE_CLOUD_PROJECT: "ambient-project",
+        AGY_ADC_AUTH: "true",
+        agy_adc_auth: "1",
+        GEMINI_HOME: "/persistent/profile",
+        SSH_CONNECTION: "127.0.0.1 0 127.0.0.1 0",
+        AGY_ACP_FORCE_FILE_STORAGE: "1",
+        AGY_CLI_FORCE_FILE_TOKEN_STORAGE: "1",
+        ELECTRON_RUN_AS_NODE: "1",
+      },
+      {
+        isolatedHome: "/tmp/iso-home",
+        isolatedGeminiHome: "/tmp/iso-home/.gemini",
+        gcpProject: "configured-project",
+        gcpLocation: "us-central1",
+      },
+    );
+    expect(cleaned).toEqual({
+      PATH: "/usr/local/bin",
+      HOME: "/tmp/iso-home",
+      USERPROFILE: "/tmp/iso-home",
+      GEMINI_HOME: "/tmp/iso-home/.gemini",
+      GOOGLE_CLOUD_PROJECT: "configured-project",
+      GOOGLE_CLOUD_LOCATION: "us-central1",
+      TERM: "xterm-256color",
+    });
+  });
+});
+
+describe("runOfficialAgyUsagePty", () => {
+  it.effect(
+    "waits for banner, sends /usage, captures quota output, and awaits exit on teardown",
+    () =>
+      Effect.gen(function* () {
+        const writes: string[] = [];
+        let killed = false;
+        let exitedReported = false;
+        let onDataHandler: ((chunk: string) => void) | undefined;
+        let onExitHandler: (() => void) | undefined;
+
+        const fakePtyModule: AntigravityNodePtyModule = {
+          spawn: () =>
+            ({
+              onData: (cb: (chunk: string) => void) => {
+                onDataHandler = cb;
+                queueMicrotask(() => cb("Antigravity CLI 1.5.16\n"));
+                return { dispose: () => {} };
+              },
+              onExit: (cb: () => void) => {
+                onExitHandler = cb;
+                return { dispose: () => {} };
+              },
+              write: (data: string) => {
+                writes.push(data);
+                if (data === "\r") {
+                  queueMicrotask(() => onDataHandler?.(SAMPLE_CLI_OUTPUT));
+                }
+              },
+              kill: () => {
+                killed = true;
+                queueMicrotask(() => {
+                  exitedReported = true;
+                  onExitHandler?.();
+                });
+              },
+            }) as unknown as ReturnType<AntigravityNodePtyModule["spawn"]>,
+        };
+
+        const fiber = yield* runOfficialAgyUsagePty(
+          {
+            executablePath: "/usr/local/bin/agy",
+            env: { PATH: "/usr/local/bin" },
+            cwd: "/tmp",
+          },
+          () => fakePtyModule,
+        ).pipe(Effect.scoped, Effect.forkChild);
+
+        yield* TestClock.adjust("5 seconds");
+        const output = yield* Fiber.join(fiber);
+        expect(output).toContain("Models & Quota");
+        expect(writes).toEqual(["/usage", "\r", "\x1b", "\x03\x03"]);
+        expect(killed).toBe(true);
+        expect(exitedReported).toBe(true);
+      }),
+  );
+
+  it.effect("completes a single-window quota summary promptly within the outer probe timeout", () =>
+    Effect.gen(function* () {
+      let onDataHandler: ((chunk: string) => void) | undefined;
+      let onExitHandler: (() => void) | undefined;
+      const fakePtyModule: AntigravityNodePtyModule = {
+        spawn: () =>
+          ({
+            onData: (cb: (chunk: string) => void) => {
+              onDataHandler = cb;
+              queueMicrotask(() => cb("Antigravity CLI 1.5.16\n"));
+              return { dispose: () => {} };
+            },
+            onExit: (cb: () => void) => {
+              onExitHandler = cb;
+              return { dispose: () => {} };
+            },
+            write: (data: string) => {
+              if (data === "\r") {
+                queueMicrotask(() => onDataHandler?.(SECOND_ACCOUNT_CLI_OUTPUT));
+              }
+            },
+            kill: () => {
+              queueMicrotask(() => onExitHandler?.());
+            },
+          }) as unknown as ReturnType<AntigravityNodePtyModule["spawn"]>,
+      };
+
+      const fiber = yield* runOfficialAgyUsagePty(
+        {
+          executablePath: "/usr/local/bin/agy",
+          env: { PATH: "/usr/local/bin" },
+          cwd: "/tmp",
+        },
+        () => fakePtyModule,
+      ).pipe(Effect.scoped, Effect.forkChild);
+
+      yield* TestClock.adjust("6 seconds");
+      const output = yield* Fiber.join(fiber);
+      const parsed = parseAntigravityCliUsageOutput(output, 0);
+      expect(parsed?.windows).toHaveLength(1);
+      expect(parsed?.windows[0]?.usedPercent).toBe(50);
+    }),
+  );
+
+  it.effect(
+    "aborts with AntigravityCliUsageError(output_limit_exceeded) even if a valid frame preceded the overflow",
+    () =>
+      Effect.gen(function* () {
+        let killed = false;
+        let onDataHandler: ((chunk: string) => void) | undefined;
+        let onExitHandler: (() => void) | undefined;
+        const fakePtyModule: AntigravityNodePtyModule = {
+          spawn: () =>
+            ({
+              onData: (cb: (chunk: string) => void) => {
+                onDataHandler = cb;
+                queueMicrotask(() => cb("Antigravity CLI 1.5.16\n"));
+                return { dispose: () => {} };
+              },
+              onExit: (cb: () => void) => {
+                onExitHandler = cb;
+                return { dispose: () => {} };
+              },
+              write: (data: string) => {
+                if (data === "\r") {
+                  queueMicrotask(() => {
+                    onDataHandler?.(SAMPLE_CLI_OUTPUT);
+                    onDataHandler?.("x".repeat(300 * 1024));
+                  });
+                }
+              },
+              kill: () => {
+                killed = true;
+                queueMicrotask(() => onExitHandler?.());
+              },
+            }) as unknown as ReturnType<AntigravityNodePtyModule["spawn"]>,
+        };
+
+        const fiber = yield* runOfficialAgyUsagePty(
+          {
+            executablePath: "/usr/local/bin/agy",
+            env: { PATH: "/usr/local/bin" },
+            cwd: "/tmp",
+          },
+          () => fakePtyModule,
+        ).pipe(Effect.scoped, Effect.flip, Effect.forkChild);
+
+        yield* TestClock.adjust("5 seconds");
+        const error = yield* Fiber.join(fiber);
+        expect(error).toBeInstanceOf(AntigravityCliUsageError);
+        expect(error.reason).toBe("output_limit_exceeded");
+        expect(killed).toBe(true);
+      }),
+  );
+});
+
+describe("makeAntigravityUsageProbe (official CLI)", () => {
+  it.effect(
+    "caches for 5m while preserving original checkedAt, isolates HOME/GEMINI_HOME with empty MCP/hooks, and holds executable lease",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const startMs = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-24T17:00:00Z"));
+        yield* TestClock.setTime(startMs);
+        const profileDirectory = yield* createProfileWithCliToken();
+        const invocations: AntigravityCliUsageRunInput[] = [];
+        let leaseReleasedDuringRun = false;
+        let leaseReleasedAfterRun = false;
+
+        const usage = yield* makeAntigravityUsageProbe({
+          profileDirectory,
+          authMethod: "oauth-personal",
+          resolveExecutable: Effect.acquireRelease(Effect.succeed("/usr/local/bin/agy"), () =>
+            Effect.sync(() => {
+              leaseReleasedAfterRun = true;
+            }),
+          ),
+          environment: {
+            PATH: "/usr/local/bin",
+            ELECTRON_RUN_AS_NODE: "1",
+            GEMINI_API_KEY: "must-be-stripped",
+            AGY_ADC_AUTH: "true",
+          },
+          runCliUsage: (args) =>
+            Effect.gen(function* () {
+              invocations.push(args);
+              leaseReleasedDuringRun = leaseReleasedAfterRun;
+              const isolatedGemini = args.env.GEMINI_HOME ?? "";
+              expect(isolatedGemini).toBe(path.join(args.cwd, ".gemini"));
+              const mcpConfig = yield* fs
+                .readFileString(path.join(isolatedGemini, "config", "mcp_config.json"))
+                .pipe(Effect.orElseSucceed(() => ""));
+              const hooksConfig = yield* fs
+                .readFileString(path.join(isolatedGemini, "config", "hooks.json"))
+                .pipe(Effect.orElseSucceed(() => ""));
+              expect(mcpConfig).toBe('{"mcpServers":{}}');
+              expect(hooksConfig).toBe("{}");
+              return SAMPLE_CLI_OUTPUT;
+            }),
+        });
+
+        const first = yield* usage.probe;
+        const expectedFingerprint = yield* antigravityEmailFingerprint("user@example.com");
+        expect(invocations).toHaveLength(1);
+        expect(leaseReleasedDuringRun).toBe(false);
+        expect(leaseReleasedAfterRun).toBe(true);
+        expect(invocations[0]?.executablePath).toBe("/usr/local/bin/agy");
+        expect(invocations[0]?.env.ELECTRON_RUN_AS_NODE).toBeUndefined();
+        expect(invocations[0]?.env.GEMINI_API_KEY).toBeUndefined();
+        expect(invocations[0]?.env.AGY_ADC_AUTH).toBeUndefined();
+        expect(invocations[0]?.env.HOME).toBe(invocations[0]?.cwd);
+        expect(invocations[0]?.env.GEMINI_HOME).not.toBe(profileDirectory);
+        expect(first.unavailable).toBeUndefined();
+        expect(first.windows).toHaveLength(4);
+        expect(first.credentialFingerprint).toBe(expectedFingerprint);
+        expect(first.checkedAt).toBe(isoAt(startMs));
+
+        // Within 5 minutes: served from cache with original checkedAt preserved.
+        yield* TestClock.adjust("2 minutes");
+        const cached = yield* usage.probe;
+        expect(invocations).toHaveLength(1);
+        expect(cached.checkedAt).toBe(first.checkedAt);
+
+        // After 5 minutes: cache expires and probes fresh data.
+        yield* TestClock.adjust("4 minutes");
+        const refreshed = yield* usage.probe;
+        expect(invocations).toHaveLength(2);
+        expect(refreshed.checkedAt).toBe(isoAt(startMs + 6 * 60_000));
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("deduplicates concurrent probe calls so only one CLI process runs", () =>
+    Effect.gen(function* () {
+      const startMs = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-24T17:00:00Z"));
+      yield* TestClock.setTime(startMs);
+      const profileDirectory = yield* createProfileWithCliToken();
+      const gate = yield* Deferred.make<void>();
+      let calls = 0;
+
+      const usage = yield* makeAntigravityUsageProbe({
+        profileDirectory,
+        authMethod: "oauth-personal",
+        runCliUsage: () =>
+          Effect.gen(function* () {
+            calls++;
+            yield* Deferred.await(gate);
+            return SAMPLE_CLI_OUTPUT;
+          }),
+      });
+
+      const firstFiber = yield* Effect.forkChild(usage.probe);
+      const secondFiber = yield* Effect.forkChild(usage.probe);
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(gate, undefined);
+
+      const [first, second] = yield* Effect.all([Fiber.join(firstFiber), Fiber.join(secondFiber)]);
+      expect(calls).toBe(1);
+      expect(first.unavailable).toBeUndefined();
+      expect(second.unavailable).toBeUndefined();
+      expect(second.checkedAt).toBe(first.checkedAt);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect(
+    "allows keyring-only oauth-business instances (without plaintext token file) and forwards GCP project/location",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const profileDirectory = yield* fs.makeTempDirectoryScoped();
+        const invocations: AntigravityCliUsageRunInput[] = [];
+
+        const usage = yield* makeAntigravityUsageProbe({
+          profileDirectory,
+          authMethod: "oauth-business",
+          gcpProject: "enterprise-proj",
+          gcpLocation: "us-central1",
+          runCliUsage: (args) => {
+            invocations.push(args);
+            return Effect.succeed(SAMPLE_CLI_OUTPUT);
+          },
+        });
+
+        const limits = yield* usage.probe;
+        expect(limits.unavailable).toBeUndefined();
+        expect(invocations).toHaveLength(1);
+        expect(invocations[0]?.args).toEqual(["--project", "enterprise-proj"]);
+        expect(invocations[0]?.env.GOOGLE_CLOUD_PROJECT).toBe("enterprise-proj");
+        expect(invocations[0]?.env.GOOGLE_CLOUD_LOCATION).toBe("us-central1");
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("discards cached quota immediately on clear() when switching accounts", () =>
+    Effect.gen(function* () {
+      const startMs = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-24T17:00:00Z"));
+      yield* TestClock.setTime(startMs);
+      const profileDirectory = yield* createProfileWithCliToken();
+      let currentOutput = SAMPLE_CLI_OUTPUT;
+      let calls = 0;
+
+      const usage = yield* makeAntigravityUsageProbe({
+        profileDirectory,
+        authMethod: "oauth-personal",
+        runCliUsage: () => {
+          calls++;
+          return Effect.succeed(currentOutput);
+        },
+      });
+
+      const accountA = yield* usage.probe;
+      expect(calls).toBe(1);
+
+      yield* TestClock.adjust("20 seconds");
+      currentOutput = SECOND_ACCOUNT_CLI_OUTPUT;
+      yield* usage.clear;
+
+      const accountB = yield* usage.probe;
+      expect(calls).toBe(2);
+      expect(accountB.credentialFingerprint).not.toBe(accountA.credentialFingerprint);
+      expect(accountB.windows[0]?.usedPercent).toBe(50);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("applies a 60s cooldown floor after failed attempts without re-spawning the CLI", () =>
+    Effect.gen(function* () {
+      const startMs = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-24T17:00:00Z"));
+      yield* TestClock.setTime(startMs);
+      const profileDirectory = yield* createProfileWithCliToken();
+      let calls = 0;
+
+      const usage = yield* makeAntigravityUsageProbe({
+        profileDirectory,
+        authMethod: "oauth-personal",
+        runCliUsage: () => {
+          calls++;
+          return Effect.fail(new AntigravityCliUsageError({ reason: "spawn_failed" }));
+        },
+      });
+
+      const first = yield* usage.probe;
+      expect(calls).toBe(1);
+      expect(first.unavailable?.reason).toBe("probeFailed");
+
+      yield* TestClock.adjust("20 seconds");
+      const second = yield* usage.probe;
+      expect(calls).toBe(1);
+      expect(second.unavailable?.reason).toBe("probeFailed");
+
+      yield* TestClock.adjust("45 seconds");
+      yield* usage.probe;
+      expect(calls).toBe(2);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("does not fall back to PATH agy when resolveExecutable rejects the binary", () =>
+    Effect.gen(function* () {
+      const profileDirectory = yield* createProfileWithCliToken();
+      let calls = 0;
+
+      const usage = yield* makeAntigravityUsageProbe({
+        profileDirectory,
+        authMethod: "oauth-personal",
+        resolveExecutable: Effect.fail(
+          new AntigravityCliUsageError({ reason: "resolve_executable" }),
+        ),
+        runCliUsage: () => {
+          calls++;
+          return Effect.succeed(SAMPLE_CLI_OUTPUT);
+        },
+      });
+
+      const limits = yield* usage.probe;
+      expect(calls).toBe(0);
+      expect(limits.unavailable?.reason).toBe("probeFailed");
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect(
+    "returns unsupported without launching CLI for an unsigned-in oauth-personal profile",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const profileDirectory = yield* fs.makeTempDirectoryScoped();
+        let calls = 0;
+
+        const usage = yield* makeAntigravityUsageProbe({
+          profileDirectory,
+          authMethod: "oauth-personal",
+          runCliUsage: () => {
+            calls++;
+            return Effect.succeed(SAMPLE_CLI_OUTPUT);
+          },
+        });
+
+        const limits = yield* usage.probe;
+        expect(calls).toBe(0);
+        expect(limits.unavailable?.reason).toBe("unsupported");
+        expect(limits.windows).toEqual([]);
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("returns unsupported for API key auth without invoking the CLI", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const profileDirectory = yield* fs.makeTempDirectoryScoped();
+      let calls = 0;
+
+      const usage = yield* makeAntigravityUsageProbe({
+        profileDirectory,
+        authMethod: "gemini-api-key",
+        runCliUsage: () => {
+          calls++;
+          return Effect.succeed(SAMPLE_CLI_OUTPUT);
+        },
+      });
+
+      const limits = yield* usage.probe;
+      expect(calls).toBe(0);
+      expect(limits.unavailable?.reason).toBe("unsupported");
+      expect(limits.windows).toEqual([]);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+});
+
+describe("antigravitySummaryWindows (CLIProxyAPI hub helper)", () => {
   it.effect("omits rolling resets for untouched summary buckets and keeps used Gemini resets", () =>
     Effect.gen(function* () {
-      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-21T10:16:04Z")));
-      const { probe } = yield* fixture({
-        summary: {
+      const requestedAt = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-21T10:16:04Z"));
+      const windows = yield* antigravitySummaryWindows(
+        {
           groups: [
             {
               buckets: [
@@ -162,34 +643,19 @@ describe("Antigravity subscription limits", () => {
                   resetTime: "2026-10-21T15:16:05Z",
                 },
                 {
-                  bucketId: "3p-weekly",
-                  window: "weekly",
-                  remainingFraction: 1,
-                  resetTime: "2026-10-28T10:16:05Z",
-                },
-                {
                   bucketId: "gemini-5h",
                   window: "5h",
-                  remainingFraction: 0.848104,
+                  remainingFraction: 0.85,
                   resetTime: "2026-10-21T13:29:53Z",
-                  description:
-                    "You have used some of your 5-hour limit, it will fully refresh in 3 hours, 13 minutes.",
-                },
-                {
-                  bucketId: "gemini-weekly",
-                  window: "weekly",
-                  remainingFraction: 0.9620177,
-                  resetTime: "2026-10-28T08:29:53Z",
-                  description:
-                    "You have used some of your weekly limit, it will fully refresh in 6 days, 22 hours.",
+                  description: "Used some of your 5-hour limit.",
                 },
               ],
             },
           ],
         },
-      });
-      const limits = yield* probe;
-      const byId = new Map(limits.windows.map((window) => [window.id, window]));
+        requestedAt,
+      );
+      const byId = new Map(windows.map((window) => [window.id, window]));
       expect(byId.get("3p-5h")).toEqual({
         id: "3p-5h",
         label: "Claude & GPT (shared) · 5-hour",
@@ -197,590 +663,7 @@ describe("Antigravity subscription limits", () => {
         usedPercent: 0,
         windowDurationMins: 300,
       });
-      expect(byId.get("3p-weekly")).toEqual({
-        id: "3p-weekly",
-        label: "Claude & GPT (shared) · Weekly",
-        kind: "weekly",
-        usedPercent: 0,
-        windowDurationMins: 10080,
-      });
       expect(byId.get("gemini-5h")?.resetsAt).toBe("2026-10-21T13:29:53.000Z");
-      expect(byId.get("gemini-weekly")?.resetsAt).toBe("2026-10-28T08:29:53.000Z");
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  // Oracle: measure the tolerance from the summary request, after auth.
-  it.effect("uses summary request time after authentication for the reset tolerance", () =>
-    Effect.gen(function* () {
-      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-21T10:16:02Z")));
-      const { probe } = yield* fixture({
-        userInfoAt: DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-21T10:16:04Z")),
-        summary: {
-          buckets: [
-            {
-              bucketId: "3p-5h",
-              window: "5h",
-              remainingFraction: 1,
-              resetTime: "2026-10-21T15:17:03Z",
-            },
-          ],
-        },
-      });
-      expect((yield* probe).windows[0]?.resetsAt).toBeUndefined();
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  // Oracle: keep descriptions, measured resets, and spent buckets.
-  it.effect("keeps summary resets with a description, a distant reset, or no quota left", () =>
-    Effect.gen(function* () {
-      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-21T10:16:04Z")));
-      const { probe } = yield* fixture({
-        summary: {
-          buckets: [
-            {
-              bucketId: "described",
-              window: "5h",
-              remainingFraction: 1,
-              description: "Reported reset",
-              resetTime: "2026-10-21T15:16:04Z",
-            },
-            {
-              bucketId: "distant",
-              window: "weekly",
-              remainingFraction: 1,
-              resetTime: "2026-10-28T12:16:04Z",
-            },
-            {
-              bucketId: "spent",
-              window: "5h",
-              remainingFraction: 0,
-              resetTime: "2026-10-21T15:16:04Z",
-            },
-            {
-              bucketId: "overfull",
-              window: "5h",
-              remainingFraction: 1.01,
-              resetTime: "2026-10-21T15:16:04Z",
-            },
-            {
-              bucketId: "empty-description",
-              window: "5h",
-              remainingFraction: 1,
-              description: "",
-              resetTime: "2026-10-21T15:16:04Z",
-            },
-          ],
-        },
-      });
-      expect((yield* probe).windows.map(({ id, resetsAt }) => ({ id, resetsAt }))).toEqual([
-        { id: "described", resetsAt: "2026-10-21T15:16:04.000Z" },
-        { id: "empty-description", resetsAt: "2026-10-21T15:16:04.000Z" },
-        { id: "overfull", resetsAt: "2026-10-21T15:16:04.000Z" },
-        { id: "spent", resetsAt: "2026-10-21T15:16:04.000Z" },
-        { id: "distant", resetsAt: "2026-10-28T12:16:04.000Z" },
-      ]);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  // Oracle: the 60-second tolerance applies to both known window lengths.
-  it.effect("omits summary resets 59 seconds away but keeps resets 61 seconds away", () =>
-    Effect.gen(function* () {
-      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-21T10:16:04Z")));
-      const { probe } = yield* fixture({
-        summary: {
-          buckets: [
-            {
-              bucketId: "5h-before",
-              window: "5h",
-              remainingFraction: 1,
-              resetTime: "2026-10-21T15:15:05Z",
-            },
-            {
-              bucketId: "5h-after",
-              window: "5h",
-              remainingFraction: 1,
-              resetTime: "2026-10-21T15:17:05Z",
-            },
-            {
-              bucketId: "5h-edge",
-              window: "5h",
-              remainingFraction: 1,
-              resetTime: "2026-10-21T15:17:04Z",
-            },
-            {
-              bucketId: "weekly-after",
-              window: "weekly",
-              remainingFraction: 1,
-              resetTime: "2026-10-28T10:17:03Z",
-            },
-            {
-              bucketId: "weekly-before",
-              window: "weekly",
-              remainingFraction: 1,
-              resetTime: "2026-10-28T10:15:03Z",
-            },
-            {
-              bucketId: "weekly-edge",
-              window: "weekly",
-              remainingFraction: 1,
-              resetTime: "2026-10-28T10:15:04Z",
-            },
-          ],
-        },
-      });
-      expect((yield* probe).windows.map(({ id, resetsAt }) => ({ id, resetsAt }))).toEqual([
-        { id: "5h-after", resetsAt: "2026-10-21T15:17:05.000Z" },
-        { id: "5h-before", resetsAt: undefined },
-        { id: "5h-edge", resetsAt: undefined },
-        { id: "weekly-after", resetsAt: undefined },
-        { id: "weekly-before", resetsAt: "2026-10-28T10:15:03.000Z" },
-        { id: "weekly-edge", resetsAt: undefined },
-      ]);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  // Oracle: workspace sign-ins are metered on cloudcode-pa, so its reading wins even when less used.
-  it.effect("reports a business account's quota from the endpoint it is metered on", () =>
-    Effect.gen(function* () {
-      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-21T10:16:04Z")));
-      const { probe } = yield* fixture({
-        authMethod: "oauth-business",
-        summaryByHost: {
-          "daily-cloudcode-pa.googleapis.com": {
-            buckets: [
-              {
-                bucketId: "3p-5h",
-                window: "5h",
-                remainingFraction: 1,
-                resetTime: "2026-10-21T15:16:04Z",
-              },
-              {
-                bucketId: "3p-weekly",
-                window: "weekly",
-                remainingFraction: 0.5,
-                resetTime: "2026-10-27T10:16:04Z",
-              },
-            ],
-          },
-          "cloudcode-pa.googleapis.com": {
-            buckets: [
-              {
-                bucketId: "3p-5h",
-                window: "5h",
-                remainingFraction: 0.5,
-                resetTime: "2026-10-21T13:16:04Z",
-              },
-              {
-                bucketId: "3p-weekly",
-                window: "weekly",
-                remainingFraction: 1,
-                resetTime: "2026-10-28T10:16:04Z",
-              },
-            ],
-          },
-        },
-      });
-      expect((yield* probe).windows).toEqual([
-        {
-          id: "3p-5h",
-          label: "Claude & GPT (shared) · 5-hour",
-          kind: "session",
-          usedPercent: 50,
-          windowDurationMins: 300,
-          resetsAt: "2026-10-21T13:16:04.000Z",
-        },
-        {
-          id: "3p-weekly",
-          label: "Claude & GPT (shared) · Weekly",
-          kind: "weekly",
-          usedPercent: 0,
-          windowDurationMins: 10080,
-        },
-      ]);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  // Oracle: model quotas have no evidence for the summary-only rule.
-  it.effect("keeps full model fallback resets even at a full window from the request", () =>
-    Effect.gen(function* () {
-      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-21T10:16:04Z")));
-      const { probe } = yield* fixture({
-        summaryStatus: 404,
-        models: {
-          models: {
-            "gemini-a": {
-              quotaInfo: { remainingFraction: 1, resetTime: "2026-10-21T15:16:04Z" },
-              weeklyQuotaInfo: { remainingFraction: 1, resetTime: "2026-10-28T10:16:04Z" },
-            },
-          },
-        },
-      });
-      expect(
-        (yield* probe).windows.map(({ id, resetsAt, windowDurationMins }) => ({
-          id,
-          resetsAt,
-          windowDurationMins,
-        })),
-      ).toEqual([
-        { id: "gemini-weekly", resetsAt: "2026-10-28T10:16:04.000Z", windowDurationMins: 10080 },
-        { id: "gemini-quota", resetsAt: "2026-10-21T15:16:04.000Z", windowDurationMins: undefined },
-      ]);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  it.effect("reports separate Gemini and shared Claude/GPT five-hour and weekly limits", () =>
-    Effect.gen(function* () {
-      const { probe, requests } = yield* fixture();
-      const limits = yield* probe;
-      expect(limits.windows).toHaveLength(4);
-      expect(limits.unavailable).toBeUndefined();
-      expect(limits.credentialFingerprint).toMatch(/^[0-9a-f]{64}$/);
-      const byId = new Map(limits.windows.map((window) => [window.id, window]));
-      expect(byId.get("gemini-weekly")?.usedPercent).toBeCloseTo(4);
-      expect(byId.get("gemini-5h")?.usedPercent).toBeCloseTo(9);
-      expect(byId.get("3p-weekly")).toMatchObject({
-        label: "Claude & GPT (shared) · Weekly",
-        kind: "weekly",
-        usedPercent: 100,
-        windowDurationMins: 10080,
-        resetsAt: "2026-10-10T15:28:22.000Z",
-      });
-      expect(byId.get("3p-5h")).toMatchObject({ kind: "session", windowDurationMins: 300 });
-      expect(byId.get("3p-5h")?.usedPercent).toBeCloseTo(56);
-      yield* probe;
-      expect(requests.filter((request) => request.url.endsWith("/token"))).toHaveLength(1);
-      expect(
-        requests.filter((request) => request.url.endsWith(":retrieveUserQuotaSummary")),
-      ).toHaveLength(4);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  it.effect("merges quota groups that only one endpoint reports", () =>
-    Effect.gen(function* () {
-      const { probe } = yield* fixture({
-        summaryByHost: {
-          // The daily endpoint can omit Gemini while the other endpoint returns all groups.
-          "daily-cloudcode-pa.googleapis.com": {
-            groups: [
-              {
-                displayName: "Claude and GPT models",
-                buckets: [
-                  { bucketId: "3p-weekly", window: "weekly", remainingFraction: 0.5 },
-                  { bucketId: "3p-5h", window: "5h", remainingFraction: 0.3 },
-                ],
-              },
-            ],
-          },
-        },
-      });
-      const limits = yield* probe;
-      expect(limits.windows.map((window) => window.id).toSorted()).toEqual([
-        "3p-5h",
-        "3p-weekly",
-        "gemini-5h",
-        "gemini-weekly",
-      ]);
-      const byId = new Map(limits.windows.map((window) => [window.id, window]));
-      expect(byId.get("gemini-weekly")?.label).toBe("Gemini · Weekly");
-      expect(byId.get("3p-5h")?.usedPercent).toBeCloseTo(70);
-      expect(byId.get("3p-weekly")?.usedPercent).toBe(50);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  // Oracle: reported payloads for a personal sign-in, whose runtime meters on the daily endpoint.
-  it.effect("reports a personal account's quota from the daily endpoint it is metered on", () =>
-    Effect.gen(function* () {
-      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-07T12:00:00Z")));
-      const argon = (remainingFraction: number, resetTime: string) => ({
-        groups: [
-          {
-            displayName: "Gemini 4 Argon",
-            buckets: [
-              {
-                bucketId: "gemini-argon-wtu-weekly",
-                window: "weekly",
-                remainingFraction,
-                resetTime,
-              },
-            ],
-          },
-        ],
-      });
-      const { probe } = yield* fixture({
-        authMethod: "oauth-personal",
-        summaryByHost: {
-          "daily-cloudcode-pa.googleapis.com": argon(0.8623059, "2026-11-14T08:41:35Z"),
-          "cloudcode-pa.googleapis.com": argon(0, "2026-11-08T18:27:14Z"),
-        },
-      });
-      expect((yield* probe).windows).toEqual([
-        expect.objectContaining({
-          id: "gemini-argon-wtu-weekly",
-          usedPercent: expect.closeTo(13.77, 2),
-          resetsAt: "2026-11-14T08:41:35.000Z",
-        }),
-      ]);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  it.effect("labels Argon and Carbon quotas apart from the default Gemini quota", () =>
-    Effect.gen(function* () {
-      const { probe } = yield* fixture({
-        summary: {
-          groups: [
-            ...summary.groups,
-            {
-              displayName: "Gemini 4 Argon",
-              buckets: [
-                { bucketId: "gemini-argon-wtu-weekly", window: "weekly", remainingFraction: 0.6 },
-              ],
-            },
-            {
-              displayName: "Gemini 4 Carbon",
-              buckets: [
-                { bucketId: "gemini-carbon-wtu-weekly", window: "weekly", remainingFraction: 0.4 },
-              ],
-            },
-            {
-              displayName: " ",
-              buckets: [{ bucketId: "gemini-carbon-5h", window: "5h", remainingFraction: 0.8 }],
-            },
-          ],
-        },
-      });
-      const limits = yield* probe;
-      const byId = new Map(limits.windows.map((window) => [window.id, window]));
-      expect(byId.get("gemini-weekly")?.label).toBe("Gemini · Weekly");
-      expect(byId.get("gemini-argon-wtu-weekly")?.label).toBe("Gemini 4 Argon · Weekly");
-      expect(byId.get("gemini-carbon-wtu-weekly")?.label).toBe("Gemini 4 Carbon · Weekly");
-      expect(byId.get("gemini-carbon-5h")?.label).toBe("Gemini Carbon · 5-hour");
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  it.effect("keeps one endpoint's quotas when the other fails", () =>
-    Effect.gen(function* () {
-      const { probe } = yield* fixture({
-        summaryStatusByHost: { "daily-cloudcode-pa.googleapis.com": 503 },
-      });
-      const limits = yield* probe;
-      expect(limits.unavailable).toBeUndefined();
-      expect(limits.windows).toHaveLength(4);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  it.effect("re-reads changed credentials and clears cached access after sign-out", () =>
-    Effect.gen(function* () {
-      const { probe, clear, requests, writeToken, tokenPath } = yield* fixture();
-      const first = yield* probe;
-      yield* writeToken("refresh-b");
-      const second = yield* probe;
-      expect(second.credentialFingerprint).not.toBe(first.credentialFingerprint);
-      expect(requests.filter((request) => request.url.endsWith("/token"))).toHaveLength(2);
-      yield* (yield* FileSystem.FileSystem).remove(tokenPath);
-      expect((yield* probe).unavailable?.reason).toBe("unsupported");
-      yield* writeToken("refresh-b");
-      yield* probe;
-      expect(requests.filter((request) => request.url.endsWith("/token"))).toHaveLength(3);
-      yield* clear;
-      yield* probe;
-      expect(requests.filter((request) => request.url.endsWith("/token"))).toHaveLength(4);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  it.effect("names one Google account the same way from every sign-in", () =>
-    Effect.gen(function* () {
-      const read = (refreshToken: string, userId: string) =>
-        fixture({ refreshToken, userId }).pipe(Effect.flatMap((usage) => usage.probe));
-      const machineA = yield* read("refresh-a", "google-user-1");
-      const machineB = yield* read("refresh-b", "google-user-1");
-      const otherAccount = yield* read("refresh-c", "google-user-2");
-      expect(machineA.credentialFingerprint).toMatch(/^[0-9a-f]{64}$/);
-      expect(machineB.credentialFingerprint).toBe(machineA.credentialFingerprint);
-      expect(otherAccount.credentialFingerprint).not.toBe(machineA.credentialFingerprint);
-      expect(JSON.stringify(machineA)).not.toMatch(/google-user-1|someone@example.com/);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  it.effect("falls back to model quotas without inventing a window duration", () =>
-    Effect.gen(function* () {
-      const { probe } = yield* fixture({
-        summaryStatus: 404,
-        models: {
-          models: {
-            "gemini-a": {
-              modelProvider: "MODEL_PROVIDER_GOOGLE",
-              quotaInfo: { remainingFraction: 0.8, resetTime: "2026-10-10T12:00:00Z" },
-            },
-            "gemini-b": {
-              modelProvider: "MODEL_PROVIDER_GOOGLE",
-              quotaInfo: { remainingFraction: 0.6, resetTime: "2026-10-10T12:00:00Z" },
-            },
-            "claude-a": { quotaInfo: { remainingFraction: 0.2 } },
-          },
-        },
-      });
-      const limits = yield* probe;
-      expect(limits.windows).toHaveLength(2);
-      expect(limits.windows.find((window) => window.id === "gemini-quota")?.usedPercent).toBe(40);
-      expect(
-        limits.windows.every(
-          (window) => window.kind === "other" && window.windowDurationMins === undefined,
-        ),
-      ).toBe(true);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  it.effect("skips disabled and missing fractions and clamps valid percentages", () =>
-    Effect.gen(function* () {
-      const { probe } = yield* fixture({
-        summary: {
-          buckets: [
-            { bucketId: "disabled", remainingFraction: 0, disabled: true },
-            { bucketId: "missing", resetTime: "2026-10-10T12:00:00Z" },
-            { bucketId: "gemini-5h", window: "5h", remainingFraction: 2, resetTime: "invalid" },
-          ],
-        },
-      });
-      expect((yield* probe).windows).toEqual([
-        {
-          id: "gemini-5h",
-          kind: "session",
-          label: "Gemini · 5-hour",
-          usedPercent: 0,
-          windowDurationMins: 300,
-        },
-      ]);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  it.effect("returns a safe failure when OAuth refresh fails", () =>
-    Effect.gen(function* () {
-      const { probe } = yield* fixture({ tokenStatus: 401 });
-      const limits = yield* probe;
-      expect(limits.windows).toEqual([]);
-      expect(limits.unavailable?.reason).toBe("probeFailed");
-      expect(JSON.stringify(limits)).not.toMatch(/client-secret|refresh-a|access-token/);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  it.effect("reads the native CLI's stored sign-in when acp_token.json is absent", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const { probe, tokenPath } = yield* fixture({ missingToken: true });
-      // The 1.5.x CLI never writes acp_token.json; without a keyring it stores this file instead.
-      yield* fs.writeFileString(
-        path.join(path.dirname(tokenPath), "antigravity-oauth-token"),
-        JSON.stringify({
-          token: {
-            access_token: "access-token",
-            token_type: "Bearer",
-            refresh_token: "refresh-a",
-            expiry: "2099-01-01T00:00:00Z",
-            expires_in: 3600,
-          },
-          auth_method: "consumer",
-          id_token_email: "someone@example.com",
-        }),
-      );
-      const limits = yield* probe;
-      expect(limits.unavailable?.message).not.toBe(
-        "Sign in with Google to see Antigravity limits.",
-      );
-      expect(limits.unavailable?.reason).not.toBe("unsupported");
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  it.effect("reads a Gemini Enterprise keyring sign-in and reports when it has expired", () =>
-    Effect.gen(function* () {
-      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T12:00:00Z")));
-      const keyringSecret = (expiry: string) =>
-        JSON.stringify({ token: { access_token: "access-token", refresh_token: "r", expiry } });
-      // Google account instances keep their own sign-in; the shared entry belongs to another app.
-      const personal = yield* fixture({
-        missingToken: true,
-        keyringSecret: keyringSecret("2026-10-09T14:00:00Z"),
-      });
-      expect((yield* personal.probe).unavailable?.message).toBe(
-        "Sign in with Google to see Antigravity limits.",
-      );
-      expect(personal.requests).toEqual([]);
-
-      const signedIn = yield* fixture({
-        authMethod: "oauth-business",
-        missingToken: true,
-        userId: "google-user-1",
-        keyringSecret: keyringSecret("2026-10-09T14:00:00.123456789+01:00"),
-      });
-      const limits = yield* signedIn.probe;
-      expect(limits.unavailable).toBeUndefined();
-      expect(limits.windows).toHaveLength(4);
-      expect(signedIn.requests.some((request) => request.url.endsWith("/token"))).toBe(false);
-
-      const expired = yield* fixture({
-        authMethod: "oauth-business",
-        missingToken: true,
-        keyringSecret: keyringSecret("2026-10-09T12:00:30Z"),
-      });
-      expect((yield* expired.probe).unavailable?.reason).toBe("probeFailed");
-      expect(expired.requests).toEqual([]);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  it.effect.runIf(HostProcess.Platform.defaultValue() === "win32")(
-    "reads go-keyring's Windows credential target without changing it",
-    (ctx) =>
-      Effect.gen(function* () {
-        // Never overwrite a real sign-in on a developer's machine.
-        if (readWindowsCliCredential(HostProcess.Architecture.defaultValue())) return ctx.skip();
-        yield* TestClock.setTime(
-          DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T12:00:00Z")),
-        );
-        const { AsyncEntry } = yield* Effect.promise(() => import("@napi-rs/keyring"));
-        // go-keyring writes the UTF-8 JSON at `<service>:<user>`.
-        const target = AsyncEntry.withTarget("gemini:antigravity", "gemini", "antigravity");
-        const stored = new TextEncoder().encode(
-          JSON.stringify({
-            token: { access_token: "access-token", expiry: "2026-10-09T14:00:00Z" },
-          }),
-        );
-        yield* Effect.acquireRelease(
-          Effect.promise(() => target.setSecret(stored)),
-          () => Effect.promise(() => target.deleteCredential()),
-        );
-        const { probe } = yield* fixture({
-          authMethod: "oauth-business",
-          missingToken: true,
-          nativeKeyring: true,
-        });
-        const limits = yield* probe;
-        expect(limits.unavailable).toBeUndefined();
-        expect(limits.windows).toHaveLength(4);
-        expect(readWindowsCliCredential(HostProcess.Architecture.defaultValue())).toEqual(
-          Buffer.from(stored),
-        );
-      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  it("decodes go-keyring's macOS encodings", () => {
-    const value = '{"token":{}}';
-    const bytes = (text: string) => new TextEncoder().encode(text);
-    expect(decodeGoKeyringSecret(bytes(value))).toBe(value);
-    expect(
-      decodeGoKeyringSecret(bytes(`go-keyring-base64:${Buffer.from(value).toString("base64")}`)),
-    ).toBe(value);
-    expect(
-      decodeGoKeyringSecret(bytes(`go-keyring-encoded:${Buffer.from(value).toString("hex")}`)),
-    ).toBe(value);
-  });
-
-  it.effect("does not make network requests for API keys or missing sign-ins", () =>
-    Effect.gen(function* () {
-      for (const options of [{ authMethod: "gemini-api-key" as const }, { missingToken: true }]) {
-        const { probe, requests } = yield* fixture(options);
-        expect((yield* probe).unavailable?.reason).toBe("unsupported");
-        expect(requests).toEqual([]);
-      }
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+    }),
   );
 });
