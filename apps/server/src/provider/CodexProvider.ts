@@ -141,6 +141,9 @@ const CODEX_CATALOG_REFRESH_TIMEOUT_MS = 3_000;
 const CODEX_CONFIG_PROBE_TIMEOUT_MS = 3_000;
 const CODEX_CATALOG_REFRESH_POLL = "100 millis" as const;
 const CODEX_CLIENT_NAME = "T3 Code";
+// Codex puts its originator first in the User-Agent and gateways count a turn by that token, so
+// T3's Codex turns are named "Codex" while the client name above still identifies T3 in the UA.
+const CODEX_ORIGINATOR = "Codex";
 // Handshake plus account/models/skills requests can exceed the shared 10s probe budget.
 const CODEX_AUTH_PROBE_TIMEOUT_MS = 20_000;
 const CODEX_DISCOVERY_MARGIN_MS = 250;
@@ -603,11 +606,14 @@ const requestCodexChatGptModels = Effect.fn("requestCodexChatGptModels")(functio
   );
 });
 
-/** Set originator at spawn; the pre-initialize refresh otherwise overwrites shared cache with plain-CLI models. */
+/**
+ * Set the originator at spawn; the pre-initialize refresh otherwise overwrites the shared cache
+ * with plain-CLI models. A gateway reads it as the client's name, so it says Codex, not T3.
+ */
 export const codexAppServerEnvironment = (
   environment: NodeJS.ProcessEnv | undefined,
 ): NodeJS.ProcessEnv => ({
-  CODEX_INTERNAL_ORIGINATOR_OVERRIDE: CODEX_CLIENT_NAME,
+  CODEX_INTERNAL_ORIGINATOR_OVERRIDE: CODEX_ORIGINATOR,
   ...environment,
 });
 
