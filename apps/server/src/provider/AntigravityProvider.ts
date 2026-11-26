@@ -167,12 +167,24 @@ interface AntigravityProviderOptions {
   readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits>;
   readonly invalidateUsageCache?: Effect.Effect<void>;
   readonly clearUsage?: Effect.Effect<void>;
+  /**
+   * The account this provider's token file holds and the account the ACP process actually
+   * authenticated as. agy prefers the shared OS keyring when it can read it, so a disagreement
+   * means the session left this provider's sign-in.
+   */
+  readonly accountIdentity?: {
+    readonly expectedEmail: Effect.Effect<string | undefined>;
+    readonly observedEmail: Effect.Effect<string | undefined>;
+  };
   readonly maintenanceCapabilities?: ProviderMaintenanceCapabilities;
   readonly auth?: { readonly type: string; readonly label: string };
   /** Modes the last session advertised, saved because initialize alone does not report them. */
   readonly rememberedRuntimeModes?: ReadonlyArray<RuntimeMode>;
   readonly rememberRuntimeModes?: (modes: ReadonlyArray<RuntimeMode>) => Effect.Effect<void>;
 }
+
+const ACCOUNT_MISMATCH_MESSAGE =
+  "Antigravity signed in with a different Google account than this provider uses. Sign in again in this provider to keep its threads and quota on one account.";
 
 const RUNTIME_MODES_WITHOUT_AUTO = [
   "approval-required",
@@ -264,6 +276,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   const republish = yield* Deferred.make<Effect.Effect<ServerProvider>>();
   const scope = yield* Effect.scope;
   let usageRefreshPending = false;
+  let accountMismatch = false;
   const runUsageRead = Effect.fn("AntigravityProvider.runUsageRead")(function* (
     probeUsage: Effect.Effect<ServerProviderUsageLimits>,
   ) {
@@ -308,6 +321,36 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     yield* FiberHandle.clear(usageRead);
     if (options.clearUsage) yield* options.clearUsage;
   });
+  // agy logs the account it authenticated as. A different address means the process read the
+  // shared keyring instead of this provider's token file, so the session is not this provider's.
+  const verifyAccountIdentity = Effect.gen(function* () {
+    const identity = options.accountIdentity;
+    if (identity === undefined) return;
+    const expected = yield* identity.expectedEmail;
+    if (expected === undefined) return;
+    let observed: string | undefined;
+    for (let attempt = 0; attempt < 6 && observed === undefined; attempt++) {
+      if (attempt > 0) yield* Effect.sleep("200 millis");
+      observed = yield* identity.observedEmail;
+    }
+    if (observed === undefined) {
+      yield* Effect.logWarning("Antigravity sign-in could not be verified from the ACP log.");
+      return;
+    }
+    if (observed.trim().toLowerCase() === expected.trim().toLowerCase()) {
+      accountMismatch = false;
+      return;
+    }
+    accountMismatch = true;
+    yield* SubscriptionRef.update(metadata, (state): AntigravityProviderState =>
+      state.draft.auth.status === "authenticated"
+        ? {
+            ...state,
+            draft: { ...state.draft, status: "warning", message: ACCOUNT_MISMATCH_MESSAGE },
+          }
+        : state,
+    );
+  });
 
   const checkProvider = Effect.fn("checkAntigravityProvider")(function* () {
     if (!settings.enabled) return yield* getSnapshot;
@@ -340,8 +383,11 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
       if (state.authRevision !== before.authRevision) return state;
       const { message: _previousMessage, ...draft } = state.draft;
       const authenticated = draft.auth.status === "authenticated";
+      const mismatchMessage =
+        authenticated && accountMismatch ? ACCOUNT_MISMATCH_MESSAGE : undefined;
       const message =
         errorMessage ??
+        mismatchMessage ??
         (authenticated
           ? undefined
           : draft.auth.status === "unauthenticated"
@@ -354,7 +400,13 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           installed: !missingInstallation,
           // Lightweight custom-launcher probes lack versions; preserve the real handshake's version.
           version: version === "unknown" ? draft.version : version || draft.version,
-          status: errorMessage ? "error" : authenticated ? "ready" : "warning",
+          status: errorMessage
+            ? "error"
+            : authenticated
+              ? mismatchMessage === undefined
+                ? "ready"
+                : "warning"
+              : "warning",
           checkedAt: updatedAt,
           usageLimits: missingInstallation ? undefined : draft.usageLimits,
           ...(missingInstallation
@@ -464,6 +516,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
       return [draft.supportedRuntimeModes, next] as const;
     });
     yield* rememberRuntimeModes(previousModes, supportedRuntimeModes);
+    yield* verifyAccountIdentity;
     if (!before.draft.usageLimits || before.draft.usageLimits.unavailable) yield* refreshUsage();
   });
 
@@ -514,6 +567,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   });
 
   const clearAccountMetadata = Effect.fn("AntigravityProvider.clearAccountMetadata")(function* () {
+    accountMismatch = false;
     yield* resetUsage;
     if (!settings.enabled) return;
     const updatedAt = DateTime.formatIso(yield* DateTime.now);

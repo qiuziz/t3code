@@ -142,6 +142,10 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
     readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits>;
     readonly invalidateUsageCache?: Effect.Effect<void>;
     readonly rememberedRuntimeModes?: ReadonlyArray<RuntimeMode>;
+    readonly accountIdentity?: {
+      readonly expectedEmail: Effect.Effect<string | undefined>;
+      readonly observedEmail: Effect.Effect<string | undefined>;
+    };
   } = {},
 ) {
   const savedRuntimeModes = yield* Ref.make<ReadonlyArray<ReadonlyArray<RuntimeMode>>>([]);
@@ -164,6 +168,7 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
       ...(options.rememberedRuntimeModes
         ? { rememberedRuntimeModes: options.rememberedRuntimeModes }
         : {}),
+      ...(options.accountIdentity ? { accountIdentity: options.accountIdentity } : {}),
       rememberRuntimeModes: (modes) => Ref.update(savedRuntimeModes, (saved) => [...saved, modes]),
       probe: Ref.update(probeCalls, (count) => count + 1).pipe(
         Effect.andThen(Ref.get(probe)),
@@ -504,6 +509,38 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
         expectedCommands,
       );
       expect(yield* Ref.get(harness.probeCalls)).toBe(1);
+    }),
+  );
+
+  it.effect("flags a session that signed in as another account", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        accountIdentity: {
+          expectedEmail: Effect.succeed("profile@example.com"),
+          observedEmail: Effect.succeed("other@example.com"),
+        },
+      });
+      yield* harness.initialize;
+      yield* harness.provider.onSessionStarted(started);
+      const snapshot = yield* harness.provider.snapshot.getSnapshot;
+      expect(snapshot.status).toBe("warning");
+      expect(snapshot.message).toContain("different Google account");
+    }),
+  );
+
+  it.effect("keeps a session ready when the signed-in account matches", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        accountIdentity: {
+          expectedEmail: Effect.succeed("profile@example.com"),
+          observedEmail: Effect.succeed("profile@example.com"),
+        },
+      });
+      yield* harness.initialize;
+      yield* harness.provider.onSessionStarted(started);
+      const snapshot = yield* harness.provider.snapshot.getSnapshot;
+      expect(snapshot.status).toBe("ready");
+      expect(snapshot.message).toBeUndefined();
     }),
   );
 
