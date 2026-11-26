@@ -165,6 +165,7 @@ interface AntigravityProviderOptions {
   >;
   readonly supportsTextGeneration: Effect.Effect<boolean>;
   readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits>;
+  readonly invalidateUsageCache?: Effect.Effect<void>;
   readonly clearUsage?: Effect.Effect<void>;
   readonly maintenanceCapabilities?: ProviderMaintenanceCapabilities;
   readonly auth?: { readonly type: string; readonly label: string };
@@ -262,38 +263,48 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   const usageRead = yield* FiberHandle.make();
   const republish = yield* Deferred.make<Effect.Effect<ServerProvider>>();
   const scope = yield* Effect.scope;
+  let usageRefreshPending = false;
+  const runUsageRead = Effect.fn("AntigravityProvider.runUsageRead")(function* (
+    probeUsage: Effect.Effect<ServerProviderUsageLimits>,
+  ) {
+    while (true) {
+      usageRefreshPending = false;
+      const probed = yield* probeUsage;
+      yield* SubscriptionRef.update(metadata, (state) => ({
+        ...state,
+        draft: {
+          ...state.draft,
+          usageLimits: resolveUsageLimitsAfterProbe({
+            published: state.draft.usageLimits,
+            probed,
+          }),
+        },
+      }));
+      // Enrichment cannot change published limits; a health check publishes them.
+      yield* Deferred.await(republish).pipe(
+        Effect.flatten,
+        Effect.provideService(PublishingUsage, true),
+        Effect.ignoreCause({ log: true }),
+        Effect.forkIn(scope),
+      );
+      if (!usageRefreshPending) break;
+    }
+  });
   const refreshUsage = Effect.fn("AntigravityProvider.refreshUsage")(function* () {
     if (!options.probeUsage || (yield* PublishingUsage)) return;
     yield* FiberHandle.run(
       usageRead,
-      options.probeUsage.pipe(
-        Effect.flatMap((probed) =>
-          SubscriptionRef.update(metadata, (state) => ({
-            ...state,
-            draft: {
-              ...state.draft,
-              usageLimits: resolveUsageLimitsAfterProbe({
-                published: state.draft.usageLimits,
-                probed,
-              }),
-            },
-          })),
-        ),
-        // Enrichment cannot change published limits; a health check publishes them.
-        Effect.andThen(
-          Deferred.await(republish).pipe(
-            Effect.flatten,
-            Effect.provideService(PublishingUsage, true),
-            Effect.ignoreCause({ log: true }),
-            Effect.forkIn(scope),
-          ),
-        ),
-      ),
+      runUsageRead(options.probeUsage),
       // Store the fiber before it runs, so a sign-out during the read can interrupt it.
       { onlyIfMissing: true, startImmediately: false },
     );
   });
+  const invalidateUsageCache = Effect.gen(function* () {
+    usageRefreshPending = true;
+    if (options.invalidateUsageCache) yield* options.invalidateUsageCache;
+  });
   const resetUsage = Effect.gen(function* () {
+    usageRefreshPending = false;
     yield* FiberHandle.clear(usageRead);
     if (options.clearUsage) yield* options.clearUsage;
   });
@@ -389,6 +400,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     haveSettingsChanged: () => false,
     initialSnapshot: () => getSnapshot,
     checkProvider: checkProvider(),
+    invalidateUsageCache,
     enrichSnapshot: ({ publishSnapshot }) =>
       SubscriptionRef.changes(metadata).pipe(
         Stream.runForEach((state) =>

@@ -351,6 +351,155 @@ it.effect("takes a hub's reset for an unreset usage_limit, then refreshes the sn
   }),
 );
 
+it.effect(
+  "refreshes Antigravity usage once when a turn settles, without duplicating on usage_limit turn.terminal",
+  () =>
+    Effect.gen(function* () {
+      let refreshCalls = 0;
+      const firstRefreshed = yield* Deferred.make<void>();
+      const secondRefreshed = yield* Deferred.make<void>();
+      const driver = ProviderDriverKind.make("antigravity");
+      const instanceId = ProviderInstanceId.make("antigravity-work");
+      const adapter = yield* ProviderAdapter.ProviderAdapterV2.pipe(
+        Effect.provide(
+          Layer.mock(ProviderAdapter.ProviderAdapterV2)({
+            instanceId,
+            driver,
+          }),
+        ),
+      );
+      const instance: ProviderInstance = {
+        instanceId,
+        driverKind: driver,
+        continuationIdentity: { driverKind: driver, continuationKey: "work" },
+        enabled: true,
+        displayName: "Antigravity",
+        orchestrationAdapter: adapter,
+        textGeneration: {
+          generateBranchName: () => Effect.die("unused"),
+          generateCommitMessage: () => Effect.die("unused"),
+          generatePrContent: () => Effect.die("unused"),
+          generateThreadTitle: () => Effect.die("unused"),
+          generateReviewGuide: () => Effect.die("unused"),
+          generateTranscriptionPostProcessing: () => Effect.die("unused"),
+        },
+        snapshot: {
+          refreshUsage: Effect.sync(() => ++refreshCalls).pipe(
+            Effect.tap((count) =>
+              count === 1
+                ? Deferred.succeed(firstRefreshed, undefined)
+                : count === 2
+                  ? Deferred.succeed(secondRefreshed, undefined)
+                  : Effect.void,
+            ),
+            Effect.asVoid,
+          ),
+          getSnapshot: Effect.succeed({
+            auth: { status: "authenticated" },
+          } as ServerProvider),
+          refresh: Effect.die("unused"),
+          resolveMaintenance: () => Effect.die("unused"),
+          applyUsageLimits: () => Effect.die("unused"),
+          streamChanges: Stream.empty,
+        },
+      };
+      const instances = Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
+        getInstance: (id) => Effect.succeed(id === instanceId ? instance : undefined),
+      });
+      yield* Effect.gen(function* () {
+        const now = yield* DateTime.now;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const threadEvent = yield* threadCreatedEvent(now);
+        yield* eventSink.write({ events: [threadEvent] });
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: instanceId,
+          threadId: threadEvent.threadId,
+        });
+        const providerThreadId = idAllocator.derive.providerThread({
+          driver,
+          nativeThreadId: "agy-thread",
+        });
+        const completedTurnId = idAllocator.derive.providerTurn({
+          driver,
+          nativeTurnId: "agy-turn-1",
+        });
+        yield* ingestor.ingestNormalized({
+          providerSessionId,
+          providerInstanceId: instanceId,
+          threadId: threadEvent.threadId,
+          event: {
+            type: "provider_turn.updated",
+            driver,
+            providerTurn: {
+              id: completedTurnId,
+              providerThreadId,
+              nodeId: NodeId.make("node:agy-turn-1"),
+              runAttemptId: null,
+              nativeTurnRef: null,
+              ordinal: 1,
+              status: "completed",
+              startedAt: now,
+              completedAt: now,
+            },
+          },
+        });
+        yield* Deferred.await(firstRefreshed);
+        assert.equal(refreshCalls, 1);
+
+        // A failed usage_limit turn emits terminal provider_turn.updated followed by turn.terminal;
+        // Antigravity should refresh once for that turn, not twice.
+        const limitedTurnId = idAllocator.derive.providerTurn({
+          driver,
+          nativeTurnId: "agy-turn-2",
+        });
+        yield* ingestor.ingestNormalized({
+          providerSessionId,
+          providerInstanceId: instanceId,
+          threadId: threadEvent.threadId,
+          event: {
+            type: "provider_turn.updated",
+            driver,
+            providerTurn: {
+              id: limitedTurnId,
+              providerThreadId,
+              nodeId: NodeId.make("node:agy-turn-2"),
+              runAttemptId: null,
+              nativeTurnRef: null,
+              ordinal: 2,
+              status: "failed",
+              startedAt: now,
+              completedAt: now,
+            },
+          },
+        });
+        yield* Deferred.await(secondRefreshed);
+        yield* ingestor.ingestNormalized({
+          providerSessionId,
+          providerInstanceId: instanceId,
+          threadId: threadEvent.threadId,
+          event: {
+            type: "turn.terminal",
+            driver,
+            providerThreadId,
+            providerTurnId: limitedTurnId,
+            runOrdinal: 2,
+            failureItemOrdinal: 1,
+            status: "failed",
+            failure: makeProviderFailure({
+              class: "usage_limit",
+              message: "Quota exhausted.",
+            }),
+            threadDisposition: "reusable",
+          },
+        });
+        yield* Effect.yieldNow;
+        assert.equal(refreshCalls, 2);
+      }).pipe(Effect.provide(makeLayerTest(layerTestEventSink, instances)));
+    }),
+);
+
 it.effect("records accepted billed turn usage once without billing the context window", () => {
   const recorded: Array<ProviderUsageAnalytics.ProviderTurnReport> = [];
   const layerAnalytics = Layer.succeed(ProviderUsageAnalytics.ProviderTurnAnalytics, {
