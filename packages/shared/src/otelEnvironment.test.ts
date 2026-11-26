@@ -403,7 +403,6 @@ describe("isRelayTracingEnabled", () => {
   it("is always false so relay traces never leave this build", () => {
     assert.isFalse(OtelEnvironment.isRelayTracingEnabled({}));
     assert.isFalse(
-
       OtelEnvironment.isRelayTracingEnabled({
         T3CODE_TELEMETRY_ENABLED: "true",
         OTEL_SDK_DISABLED: "false",

@@ -10,8 +10,10 @@ it.effect("records nothing, reports no owners, and flushes without sending", () 
     const analytics = yield* AnalyticsService.AnalyticsService;
 
     assert.isFalse(yield* analytics.record("thread.created", { threadId: "thread-1" }));
-    assert.isFalse(yield* analytics.record("install.owner_observed", undefined, { anonymous: true }));
-    yield* analytics.recordOwners([{ source: "openai", ownerId: "owner-1" }], "server");
+    assert.isFalse(
+      yield* analytics.record("install.owner_observed", undefined, { anonymous: true }),
+    );
+    yield* analytics.recordOwners([{ source: "connect", ownerId: "owner-1" }], "server");
     yield* analytics.flush;
   }).pipe(Effect.provide(AnalyticsService.layer)),
 );

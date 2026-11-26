@@ -30,9 +30,9 @@ export class AnalyticsService extends Context.Service<
 /** @public */
 export const make = Effect.sync(() =>
   AnalyticsService.of({
-    record: () => Effect.succeed(false),
+    record: Effect.fn("AnalyticsService.record")(() => Effect.succeed(false)),
     flush: Effect.void,
-    recordOwners: () => Effect.void,
+    recordOwners: Effect.fn("AnalyticsService.recordOwners")(() => Effect.void),
   }),
 );
 
