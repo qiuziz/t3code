@@ -9,6 +9,8 @@ const SLOW_RPC_ACK_THRESHOLD_MS = 15_000;
  * Give these requests longer than the normal 15s warning threshold.
  */
 const LONG_RUNNING_RPC_ACK_THRESHOLD_MS = 120_000;
+/** A provider update downloads and installs an agent runtime, which legitimately takes minutes. */
+const PROVIDER_UPDATE_RPC_ACK_THRESHOLD_MS = 10 * 60_000;
 const MAX_TRACKED_RPC_ACK_REQUESTS = 256;
 let slowRpcAckThresholdMs = SLOW_RPC_ACK_THRESHOLD_MS;
 
@@ -35,7 +37,6 @@ const untrackedRpcAckMethods = new Set<string>([
   WS_METHODS.sourceControlSignInWait,
 ]);
 const longRunningRpcAckMethods = new Set<string>([
-  WS_METHODS.serverUpdateProvider,
   WS_METHODS.serverRefreshProviders,
   WS_METHODS.serverUpdateServer,
   WS_METHODS.vcsRefreshStatus,
@@ -63,6 +64,9 @@ function shouldTrackRpcAck(method: string): boolean {
 }
 
 function rpcAckThresholdMs(method: string): number {
+  if (method === WS_METHODS.serverUpdateProvider) {
+    return Math.max(slowRpcAckThresholdMs, PROVIDER_UPDATE_RPC_ACK_THRESHOLD_MS);
+  }
   return longRunningRpcAckMethods.has(method)
     ? Math.max(slowRpcAckThresholdMs, LONG_RUNNING_RPC_ACK_THRESHOLD_MS)
     : slowRpcAckThresholdMs;
