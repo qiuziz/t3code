@@ -512,10 +512,13 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
           yield* fs.writeFileString(isolatedTokenPath, profileToken);
         }
         const cleanEnv = buildAntigravityCliUsageEnv(input.environment ?? process.env, {
-          // macOS resolves the login keychain from $HOME. A temporary home makes every probe show
-          // "Keychain Not Found" (Cancel / Reset to Defaults), so keep the real home and isolate
-          // GEMINI_HOME, which is what decides where the profile's credentials live.
-          ...(platform === "darwin" ? {} : { isolatedHome }),
+          // Personal OAuth forces file token storage so macOS never touches the login keychain,
+          // and `agy -p /usage` resolves its token from `$HOME/.gemini/antigravity-cli` (ignoring
+          // GEMINI_HOME). Enterprise (`oauth-business`) may keep credentials in the macOS login
+          // keychain, so it keeps the real HOME on darwin to avoid "Keychain Not Found" prompts.
+          ...(platform === "darwin" && input.authMethod !== "oauth-personal"
+            ? {}
+            : { isolatedHome }),
           isolatedGeminiHome,
           ...(input.authMethod === "oauth-business" && input.gcpProject
             ? { gcpProject: input.gcpProject }
@@ -626,6 +629,12 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
 
   return {
     probe,
+    invalidateCache: Effect.sync(() => {
+      if (cached !== undefined) {
+        cached = { ...cached, cachedAtMs: 0 };
+      }
+      lastAttemptAtMs = 0;
+    }),
     clear: Effect.sync(() => {
       generation++;
       cached = undefined;

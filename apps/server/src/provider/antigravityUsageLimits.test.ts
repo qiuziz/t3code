@@ -352,10 +352,12 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
   );
 
   it.effect(
-    "keeps the real home on macOS so the login keychain resolves, while still isolating GEMINI_HOME",
+    "isolates HOME on macOS for oauth-personal so agy -p /usage reads the profile file token",
     () =>
       Effect.gen(function* () {
-        const profileDirectory = yield* createProfileWithCliToken();
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const profileDirectory = yield* createProfileWithCliToken("personal@example.com");
         const invocations: AntigravityCliUsageRunInput[] = [];
 
         const usage = yield* makeAntigravityUsageProbe({
@@ -365,18 +367,100 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
           environment: { PATH: "/usr/local/bin", HOME: "/Users/example" },
           resolveExecutable: Effect.succeed("/usr/local/bin/agy"),
           runCliUsage: (args) =>
-            Effect.sync(() => {
+            Effect.gen(function* () {
               invocations.push(args);
+              const isolatedToken = yield* fs
+                .readFileString(
+                  path.join(
+                    args.env.HOME ?? "",
+                    ".gemini",
+                    "antigravity-cli",
+                    "antigravity-oauth-token",
+                  ),
+                )
+                .pipe(Effect.orElseSucceed(() => ""));
+              expect(antigravityTokenEmail(isolatedToken)).toBe("personal@example.com");
               return SAMPLE_CLI_JSON;
             }),
         });
 
         yield* usage.probe;
         expect(invocations).toHaveLength(1);
-        // A temp HOME makes macOS report "Keychain Not Found" on every probe.
-        expect(invocations[0]?.env.HOME).toBe("/Users/example");
-        expect(invocations[0]?.env.GEMINI_HOME).not.toBe(profileDirectory);
+        expect(invocations[0]?.env.HOME).toBe(invocations[0]?.cwd);
+        expect(invocations[0]?.env.HOME).not.toBe("/Users/example");
+        expect(invocations[0]?.env.GEMINI_HOME).toBe(path.join(invocations[0]!.cwd, ".gemini"));
         expect(invocations[0]?.env.AGY_CLI_FORCE_FILE_TOKEN_STORAGE).toBe("1");
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("keeps the real home on macOS for oauth-business so the login keychain resolves", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const profileDirectory = yield* fs.makeTempDirectoryScoped();
+      const invocations: AntigravityCliUsageRunInput[] = [];
+
+      const usage = yield* makeAntigravityUsageProbe({
+        profileDirectory,
+        authMethod: "oauth-business",
+        platform: "darwin",
+        gcpProject: "enterprise-proj",
+        environment: { PATH: "/usr/local/bin", HOME: "/Users/example" },
+        resolveExecutable: Effect.succeed("/usr/local/bin/agy"),
+        runCliUsage: (args) =>
+          Effect.sync(() => {
+            invocations.push(args);
+            return SAMPLE_CLI_JSON;
+          }),
+      });
+
+      yield* usage.probe;
+      expect(invocations).toHaveLength(1);
+      expect(invocations[0]?.env.HOME).toBe("/Users/example");
+      expect(invocations[0]?.env.GEMINI_HOME).not.toBe(profileDirectory);
+      expect(invocations[0]?.env.AGY_CLI_FORCE_FILE_TOKEN_STORAGE).toBeUndefined();
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect(
+    "invalidateCache bypasses the 5m TTL while keeping the last good reading on transient failure",
+    () =>
+      Effect.gen(function* () {
+        const startMs = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-24T17:00:00Z"));
+        yield* TestClock.setTime(startMs);
+        const profileDirectory = yield* createProfileWithCliToken();
+        let calls = 0;
+        let mode: "first" | "second" | "fail" = "first";
+
+        const usage = yield* makeAntigravityUsageProbe({
+          profileDirectory,
+          authMethod: "oauth-personal",
+          runCliUsage: () => {
+            calls++;
+            if (mode === "fail") {
+              return Effect.fail(new AntigravityCliUsageError({ reason: "timed_out" }));
+            }
+            return Effect.succeed(mode === "first" ? SAMPLE_CLI_JSON : SECOND_ACCOUNT_CLI_JSON);
+          },
+        });
+
+        const initial = yield* usage.probe;
+        expect(calls).toBe(1);
+        expect(initial.windows).toHaveLength(4);
+
+        yield* TestClock.adjust("10 seconds");
+        mode = "second";
+        yield* usage.invalidateCache;
+        const refreshed = yield* usage.probe;
+        expect(calls).toBe(2);
+        expect(refreshed.windows[0]?.usedPercent).toBe(50);
+
+        yield* TestClock.adjust("10 seconds");
+        mode = "fail";
+        yield* usage.invalidateCache;
+        const fallback = yield* usage.probe;
+        expect(calls).toBe(3);
+        expect(fallback.unavailable).toBeUndefined();
+        expect(fallback.windows[0]?.usedPercent).toBe(50);
       }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 

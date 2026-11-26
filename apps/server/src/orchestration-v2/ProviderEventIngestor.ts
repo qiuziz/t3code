@@ -830,6 +830,13 @@ export const layer: Layer.Layer<
                     input.event.failure.class !== "usage_limit"
                   )
                     return;
+                  if (
+                    input.event.driver === "antigravity" &&
+                    completedTurnAnalytics.has(
+                      `${input.providerInstanceId}:${input.event.providerTurnId}`,
+                    )
+                  )
+                    return;
                   const instance = yield* instances.getInstance(input.providerInstanceId);
                   if (!instance?.snapshot.refreshUsage) return;
                   yield* instance.snapshot.refreshUsage.pipe(
@@ -914,6 +921,15 @@ export const layer: Layer.Layer<
                       ? {}
                       : { context: input.analyticsContext }),
                   });
+                  if (input.event.driver === "antigravity") {
+                    const instance = yield* instances.getInstance(input.providerInstanceId);
+                    if (instance?.snapshot.refreshUsage) {
+                      yield* instance.snapshot.refreshUsage.pipe(
+                        Effect.ignoreCause({ log: true }),
+                        Effect.forkIn(scope, { startImmediately: true }),
+                      );
+                    }
+                  }
                 }),
               ),
               (effect) =>

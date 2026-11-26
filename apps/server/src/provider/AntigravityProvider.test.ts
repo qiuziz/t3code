@@ -140,6 +140,7 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
     readonly enabled?: boolean;
     readonly safe?: boolean;
     readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits>;
+    readonly invalidateUsageCache?: Effect.Effect<void>;
     readonly rememberedRuntimeModes?: ReadonlyArray<RuntimeMode>;
   } = {},
 ) {
@@ -157,6 +158,9 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
       stampIdentity: (snapshot) => Effect.succeed({ ...snapshot, instanceId, driver }),
       ...(options.auth ? { auth: options.auth } : {}),
       ...(options.probeUsage ? { probeUsage: options.probeUsage } : {}),
+      ...(options.invalidateUsageCache
+        ? { invalidateUsageCache: options.invalidateUsageCache }
+        : {}),
       ...(options.rememberedRuntimeModes
         ? { rememberedRuntimeModes: options.rememberedRuntimeModes }
         : {}),
@@ -948,6 +952,78 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
       yield* harness.provider.onSessionStarted(started);
       expect((yield* republished)?.usageLimits).toEqual(failed);
     }),
+  );
+
+  it.effect(
+    "snapshot.refreshUsage invalidates the usage cache and runs one follow-up probe when a read is already in flight",
+    () =>
+      Effect.gen(function* () {
+        const invalidations = yield* Ref.make(0);
+        const reads = yield* Ref.make(0);
+        const firstStarted = yield* Deferred.make<void>();
+        const releaseFirst = yield* Deferred.make<void>();
+        const secondStarted = yield* Deferred.make<void>();
+        const releaseSecond = yield* Deferred.make<void>();
+        const thirdStarted = yield* Deferred.make<void>();
+        const firstLimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-10-09T12:00:00.000Z",
+          windows: [
+            { id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 10 },
+          ],
+        };
+        const secondLimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-10-09T12:01:00.000Z",
+          windows: [
+            { id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 25 },
+          ],
+        };
+        const thirdLimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-10-09T12:02:00.000Z",
+          windows: [
+            { id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 40 },
+          ],
+        };
+        const harness = yield* makeHarness({
+          invalidateUsageCache: Ref.update(invalidations, (count) => count + 1),
+          probeUsage: Ref.updateAndGet(reads, (count) => count + 1).pipe(
+            Effect.flatMap((count) => {
+              if (count === 1) {
+                return Deferred.succeed(firstStarted, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseFirst)),
+                  Effect.as(firstLimits),
+                );
+              }
+              if (count === 2) {
+                return Deferred.succeed(secondStarted, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseSecond)),
+                  Effect.as(secondLimits),
+                );
+              }
+              return Deferred.succeed(thirdStarted, undefined).pipe(Effect.as(thirdLimits));
+            }),
+          ),
+        });
+        const firstPublished = yield* harness.nextPublish(
+          (snapshot) => snapshot.usageLimits?.checkedAt === firstLimits.checkedAt,
+        );
+        yield* harness.initialize;
+        yield* Deferred.await(firstStarted);
+        yield* Deferred.succeed(releaseFirst, undefined);
+        expect((yield* firstPublished)?.usageLimits).toEqual(firstLimits);
+
+        // Start a refresh, then request another while the second probe is still in flight.
+        const thirdPublished = yield* harness.nextPublish(
+          (snapshot) => snapshot.usageLimits?.checkedAt === thirdLimits.checkedAt,
+        );
+        yield* harness.provider.snapshot.refreshUsage!;
+        yield* Deferred.await(secondStarted);
+        yield* harness.provider.snapshot.refreshUsage!;
+        yield* Deferred.succeed(releaseSecond, undefined);
+        yield* Deferred.await(thirdStarted);
+        expect((yield* thirdPublished)?.usageLimits).toEqual(thirdLimits);
+        expect(yield* Ref.get(invalidations)).toBe(2);
+        expect(yield* Ref.get(reads)).toBe(3);
+      }),
   );
 });
 
