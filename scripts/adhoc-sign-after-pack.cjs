@@ -48,8 +48,21 @@ const capture = (args) => {
 // ACLs reset on every release. A self-signed certificate with a fixed key gives a stable
 // designated requirement (`identifier "com.qiuz.t3code" and certificate leaf = H"..."`)
 // across releases, which keeps TCC grants and lets Squirrel accept in-app updates.
-function ensureStableSigningIdentity() {
+function prepareSigningKeychain() {
   fs.mkdirSync(SIGNING_DIR, { recursive: true, mode: 0o700 });
+  if (!fs.existsSync(STABLE_KEYCHAIN)) {
+    run(
+      ["security", "create-keychain", "-p", STABLE_PASSWORD, STABLE_KEYCHAIN],
+      "Failed to create the desktop signing keychain.",
+    );
+  }
+  run(
+    ["security", "unlock-keychain", "-p", STABLE_PASSWORD, STABLE_KEYCHAIN],
+    "Failed to unlock the desktop signing keychain.",
+  );
+}
+
+function ensureStableSigningIdentity() {
   const identities = // Not `-v`: a self-signed identity is usable for signing but is not a "valid" identity.
     capture(["security", "find-identity", "-p", "codesigning"]);
   if (identities.includes(`"${STABLE_IDENTITY}"`)) return;
@@ -101,16 +114,6 @@ function ensureStableSigningIdentity() {
     );
   }
 
-  if (!fs.existsSync(STABLE_KEYCHAIN)) {
-    run(
-      ["security", "create-keychain", "-p", STABLE_PASSWORD, STABLE_KEYCHAIN],
-      "Failed to create the desktop signing keychain.",
-    );
-  }
-  run(
-    ["security", "unlock-keychain", "-p", STABLE_PASSWORD, STABLE_KEYCHAIN],
-    "Failed to unlock the desktop signing keychain.",
-  );
   run(
     [
       "security",
@@ -186,6 +189,7 @@ module.exports = async (context) => {
     return;
   }
 
+  prepareSigningKeychain();
   withSigningKeychain(() => {
     ensureStableSigningIdentity();
     run(
