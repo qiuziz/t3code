@@ -14,6 +14,9 @@ import {
   parseSessionUpdateEvent,
   sessionModelStateFromInitialize,
   isReplayedCompleteMessage,
+  MAX_PROJECTED_MESSAGE_TURNS,
+  projectedMessageKey,
+  rememberProjectedMessageTurn,
   sessionUpdateCountsAsLoadReplayActivity,
   sessionUpdateIsReplay,
   syntheticLoadSessionResponseFromInitialize,
@@ -44,6 +47,32 @@ describe("AcpRuntimeModel", () => {
         { id: "code", name: "Code" },
       ],
     });
+  });
+
+  it("scopes reply ids by session so two threads cannot collide", () => {
+    expect(projectedMessageKey("session-a", "message-1")).not.toBe(
+      projectedMessageKey("session-b", "message-1"),
+    );
+    expect(projectedMessageKey("session-a", "message-1")).toBe(
+      projectedMessageKey("session-a", "message-1"),
+    );
+  });
+
+  it("caps the projected-message table and evicts the oldest entry", () => {
+    let seen = new Map<string, string>();
+    for (let index = 0; index < MAX_PROJECTED_MESSAGE_TURNS; index += 1) {
+      seen = rememberProjectedMessageTurn(seen, `key-${index}`, "turn:1");
+    }
+    expect(seen.size).toBe(MAX_PROJECTED_MESSAGE_TURNS);
+
+    const overflowed = rememberProjectedMessageTurn(seen, "key-overflow", "turn:2");
+    expect(overflowed.size).toBe(MAX_PROJECTED_MESSAGE_TURNS);
+    expect(overflowed.has("key-0")).toBe(false);
+    expect(overflowed.get("key-overflow")).toBe("turn:2");
+
+    const rewritten = rememberProjectedMessageTurn(overflowed, "key-overflow", "turn:3");
+    expect(rewritten.size).toBe(MAX_PROJECTED_MESSAGE_TURNS);
+    expect(rewritten.get("key-overflow")).toBe("turn:3");
   });
 
   it("treats a complete message first projected in another turn as replayed history", () => {

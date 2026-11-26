@@ -108,13 +108,20 @@ jobs:
         run: |
           set -euo pipefail
           base="$(node -p "require('./apps/desktop/package.json').version.split('-')[0]")"
+          # Capture first: a failed `gh release list` must abort instead of resetting the
+          # counter to 1 and clobbering an already published version.
+          releases="$(gh release list --limit 100 --json tagName --jq '.[].tagName')"
+          if [[ -z "${releases}" ]]; then
+            echo "::error::Cannot read existing release tags; refusing to guess the next version."
+            exit 1
+          fi
           last=0
           while read -r tag; do
             if [[ "$tag" =~ ^v${base//./\\.}-([0-9]+)$ ]]; then
               n="${BASH_REMATCH[1]}"
               [ "$n" -gt "$last" ] && last="$n"
             fi
-          done < <(gh release list --limit 100 --json tagName --jq '.[].tagName')
+          done <<< "${releases}"
           version="${base}-$((last + 1))"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "Fork build version: ${version}"

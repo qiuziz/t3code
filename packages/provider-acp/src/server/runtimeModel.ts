@@ -1324,6 +1324,27 @@ export function parsePermissionRequest(
  * A replayed message keeps its native id, so a complete message first projected in another turn
  * is history and must not become a second item in the current run.
  */
+export const MAX_PROJECTED_MESSAGE_TURNS = 1024;
+
+/** Same reply id in two sessions is not the same message; scope every key by its session. */
+export const projectedMessageKey = (sessionId: string, messageId: string): string =>
+  JSON.stringify([sessionId, messageId]);
+
+/** Remember the turn a message was first projected in, evicting the oldest entry at the cap. */
+export const rememberProjectedMessageTurn = (
+  seen: ReadonlyMap<string, string>,
+  key: string,
+  turnId: string,
+): Map<string, string> => {
+  const next = new Map(seen);
+  if (next.size >= MAX_PROJECTED_MESSAGE_TURNS && !next.has(key)) {
+    const oldest = next.keys().next().value;
+    if (oldest !== undefined) next.delete(oldest);
+  }
+  next.set(key, turnId);
+  return next;
+};
+
 export const isReplayedCompleteMessage = (input: {
   readonly complete: boolean;
   readonly seenTurnId: string | undefined;

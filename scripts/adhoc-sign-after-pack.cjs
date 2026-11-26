@@ -41,8 +41,9 @@ module.exports = async (context) => {
       "codesign",
       "--verify",
       "--verbose=2",
-      "--requirements",
-      `=${DESIGNATED_REQUIREMENT}`,
+      // -R is the test requirement; --requirements only applies while signing.
+      "-R",
+      `=identifier "${APP_ID}"`,
       appPath,
     ],
     "Signature verification failed",

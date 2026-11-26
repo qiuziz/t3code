@@ -96,6 +96,8 @@ import {
   parsePermissionRequest,
   parseSessionUpdateEvent,
   isReplayedCompleteMessage,
+  projectedMessageKey,
+  rememberProjectedMessageTurn,
   sessionUpdateIsReplay,
   toolCallVisibleOutputChanged,
   withTrackedPermissionToolCall,
@@ -7393,13 +7395,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   messageUpdate.sessionUpdate === "user_message_chunk") &&
                 messageUpdate.messageId != null
               ) {
-                const messageId = messageUpdate.messageId;
+                const messageKey = projectedMessageKey(
+                  rawNotification.sessionId,
+                  messageUpdate.messageId,
+                );
                 const context = yield* Ref.get(activeTurn);
                 const currentTurnId =
                   context !== null && context.nativeThreadId === rawNotification.sessionId
                     ? context.providerTurnId
                     : "";
-                const seenTurn = (yield* Ref.get(projectedMessageTurns)).get(messageId);
+                const seenTurn = (yield* Ref.get(projectedMessageTurns)).get(messageKey);
                 const complete =
                   messageUpdate.sessionUpdate === "agent_message" ||
                   messageUpdate.sessionUpdate === "user_message";
@@ -7412,7 +7417,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 }
                 if (seenTurn === undefined) {
                   yield* Ref.update(projectedMessageTurns, (seen) =>
-                    new Map(seen).set(messageId, currentTurnId),
+                    rememberProjectedMessageTurn(seen, messageKey, currentTurnId),
                   );
                 }
               }
