@@ -98,13 +98,6 @@ jobs:
         if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
         run: rustup target add aarch64-apple-darwin
 
-      - name: Cache stable macOS self-signing identity
-        uses: actions/cache@v4
-        id: signing_identity_cache
-        with:
-          path: ${{ runner.temp }}/t3-signing
-          key: t3-custom-mac-signing-v3
-
       # Follows upstream: apps/desktop/package.json holds the last synced release (0.1.12), and
       # each build appends -N so the app version stays monotonic for electron-updater.
       - name: Compute fork build version
@@ -130,8 +123,6 @@ jobs:
 
       - name: Package macOS arm64 DMG
         env:
-          # A cached self-signed identity keeps the designated requirement (and TCC grants) stable.
-          T3CODE_MAC_SIGNING_DIR: ${{ runner.temp }}/t3-signing
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
           T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: ${{ steps.resource_monitor_cache.outputs.cache-hit == 'true' }}
         run: vp run dist:desktop:artifact --platform mac --target dmg --arch arm64 --skip-build --build-version "${{ steps.version.outputs.version }}"
