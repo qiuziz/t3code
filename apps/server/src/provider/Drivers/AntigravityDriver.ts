@@ -70,7 +70,12 @@ import {
 import { makeAcpNativeLoggerFactory } from "@t3tools/provider-acp/server/nativeLogging";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeAntigravityProvider } from "../AntigravityProvider.ts";
-import { AntigravityCliUsageError, makeAntigravityUsageProbe } from "../antigravityUsageLimits.ts";
+import {
+  antigravityTokenEmail,
+  AntigravityCliUsageError,
+  makeAntigravityUsageProbe,
+} from "../antigravityUsageLimits.ts";
+import { readAntigravityAcpLogEmail } from "../antigravityAccountIdentity.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
 import {
@@ -183,6 +188,26 @@ export const AntigravityDriver: ProviderDriver<
       ),
     );
     const profileDirectory = directories.profile;
+    const acpDirectory = path.join(profileDirectory, "antigravity-acp");
+    const profileTokenPath = path.join(acpDirectory, "antigravity-oauth-token");
+    // Personal Google sign-ins live in the profile token file. Compare the account agy logs with
+    // that file so a session that fell back to the shared keyring cannot pass as this provider's.
+    const accountIdentity =
+      auth.authMethod === "oauth-personal"
+        ? {
+            expectedEmail: fileSystem.readFileString(profileTokenPath).pipe(
+              Effect.map((raw) => antigravityTokenEmail(raw)),
+              Effect.orElseSucceed(() => undefined),
+            ),
+            observedEmail: readAntigravityAcpLogEmail({
+              logDirectory: path.join(acpDirectory, "log"),
+            }).pipe(
+              Effect.provideService(FileSystem.FileSystem, fileSystem),
+              Effect.provideService(Path.Path, path),
+              Effect.orElseSucceed(() => undefined),
+            ),
+          }
+        : undefined;
     // Only a session reports whether agy offers Auto, so keep the last answer across restarts.
     const runtimeModesPath = path.join(profileDirectory, "t3-runtime-modes.json");
     const rememberedRuntimeModes = yield* fileSystem.readFileString(runtimeModesPath).pipe(
@@ -602,6 +627,7 @@ export const AntigravityDriver: ProviderDriver<
       probeUsage: usage.probe,
       invalidateUsageCache: usage.invalidateCache,
       clearUsage: usage.clear,
+      ...(accountIdentity ? { accountIdentity } : {}),
       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
       ...(rememberedRuntimeModes ? { rememberedRuntimeModes } : {}),
       rememberRuntimeModes: (modes) =>

@@ -19,13 +19,17 @@ import {
   makeUnavailableUsageLimits,
   makeUsageLimits,
 } from "@t3tools/provider-core/server/usageLimits";
+import { parseAntigravityAuthEmail } from "./antigravityAccountIdentity.ts";
 
 const SUMMARY_WINDOW_MINS = new Map([
   ["5h", 5 * 60],
   ["weekly", 7 * 24 * 60],
 ]);
 const AUTO_CACHE_TTL_MS = 5 * 60 * 1000;
-const FAIL_COOLDOWN_MS = 60 * 1000;
+const FAIL_COOLDOWN_MS = 5 * 60 * 1000;
+// Each CLI run refreshes the same OAuth token the agent session holds, so a turn cannot
+// relaunch the CLI every minute without racing the session's own refresh.
+const MIN_CLI_INTERVAL_MS = 10 * 60 * 1000;
 const MAX_CLI_OUTPUT_BYTES = 1024 * 1024;
 const utf8Encoder = new TextEncoder();
 
@@ -443,6 +447,7 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
       }
     | undefined;
   let lastAttemptAtMs = 0;
+  let lastCliRunAtMs = 0;
   let generation = 0;
 
   const formatCached = (entry: NonNullable<typeof cached>) => ({
@@ -475,6 +480,16 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
         reason: "probeFailed",
         message: "Could not read Antigravity limits. Refresh provider status to retry.",
       });
+    }
+
+    // 3. One CLI run per interval. A settled turn invalidates the cache; without this floor the
+    // probe would relaunch the CLI for every turn and refresh the session's token each time.
+    if (
+      cached !== undefined &&
+      lastCliRunAtMs > 0 &&
+      nowMs - lastCliRunAtMs < MIN_CLI_INTERVAL_MS
+    ) {
+      return formatCached(cached);
     }
 
     // Personal OAuth profiles isolate sign-ins per profile directory via file token storage;
@@ -532,15 +547,21 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
         }
         // agy's troubleshooting docs specify "true"; the interactive CLI keeps self-updating with "1".
         cleanEnv.AGY_CLI_DISABLE_AUTO_UPDATE = "true";
+        // The CLI reports the account it authenticated as in its own log; T3 reads that line
+        // instead of trusting that the forced file token won over the keyring.
+        const cliLogPath = path.join(isolatedHome, "usage-cli.log");
         const cliArgs = [
           "-p",
           "/usage",
           "--output-format",
           "json",
+          "--log-file",
+          cliLogPath,
           ...(input.authMethod === "oauth-business" && input.gcpProject
             ? ["--project", input.gcpProject]
             : []),
         ];
+        lastCliRunAtMs = yield* Clock.currentTimeMillis;
         const output = yield* runCliUsage({
           executablePath,
           args: cliArgs,
@@ -554,12 +575,21 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
             : yield* fs
                 .readFileString(isolatedTokenPath)
                 .pipe(Effect.orElseSucceed(() => undefined));
-        if (refreshedToken !== undefined && refreshedToken !== profileToken) {
+        const cliLog = yield* fs.readFileString(cliLogPath).pipe(Effect.orElseSucceed(() => ""));
+        const profileEmail = antigravityTokenEmail(profileToken);
+        // Only carry back a refresh for this profile's own account; another account's token must
+        // never replace the provider's saved sign-in.
+        if (
+          refreshedToken !== undefined &&
+          refreshedToken !== profileToken &&
+          profileEmail !== undefined &&
+          antigravityTokenEmail(refreshedToken) === profileEmail
+        ) {
           yield* fs
             .writeFileString(cliTokenPath, refreshedToken)
             .pipe(Effect.orElseSucceed(() => undefined));
         }
-        return { output, refreshedToken };
+        return { output, refreshedToken, cliLog, profileEmail };
       }),
     ).pipe(
       Effect.tapError(() =>
@@ -570,6 +600,23 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
         }),
       ),
     );
+
+    const authenticatedEmail = parseAntigravityAuthEmail(cliResult.cliLog);
+    if (
+      cliResult.profileEmail !== undefined &&
+      authenticatedEmail !== undefined &&
+      authenticatedEmail.trim().toLowerCase() !== cliResult.profileEmail.trim().toLowerCase()
+    ) {
+      if (generation === startedGeneration) {
+        lastAttemptAtMs = yield* Clock.currentTimeMillis;
+      }
+      return makeUnavailableUsageLimits({
+        checkedAt,
+        reason: "probeFailed",
+        message:
+          "Antigravity signed in with a different Google account than this provider's saved sign-in. Sign in again in this provider to keep quota and threads on one account.",
+      });
+    }
 
     const parsedAtMs = yield* Clock.currentTimeMillis;
     const observedAt = DateTime.formatIso(DateTime.makeUnsafe(parsedAtMs));
@@ -639,6 +686,7 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
       generation++;
       cached = undefined;
       lastAttemptAtMs = 0;
+      lastCliRunAtMs = 0;
     }),
   };
 });

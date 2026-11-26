@@ -331,7 +331,14 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
         expect(invocations[0]?.env.AGY_CLI_FORCE_FILE_TOKEN_STORAGE).toBe("1");
         expect(invocations[0]?.env.HOME).toBe(invocations[0]?.cwd);
         expect(invocations[0]?.env.GEMINI_HOME).not.toBe(profileDirectory);
-        expect(invocations[0]?.args).toEqual(["-p", "/usage", "--output-format", "json"]);
+        expect(invocations[0]?.args?.slice(0, 4)).toEqual([
+          "-p",
+          "/usage",
+          "--output-format",
+          "json",
+        ]);
+        expect(invocations[0]?.args?.[4]).toBe("--log-file");
+        expect(invocations[0]?.args?.[5]?.endsWith("usage-cli.log")).toBe(true);
         expect(first.unavailable).toBeUndefined();
         expect(first.windows).toHaveLength(4);
         expect(first.credentialFingerprint).toBe(expectedFingerprint);
@@ -343,11 +350,17 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
         expect(invocations).toHaveLength(1);
         expect(cached.checkedAt).toBe(first.checkedAt);
 
-        // After 5 minutes: cache expires and probes fresh data.
+        // After 5 minutes the cache expires, but one CLI run per 10 minutes still serves it.
         yield* TestClock.adjust("4 minutes");
+        const stillCached = yield* usage.probe;
+        expect(invocations).toHaveLength(1);
+        expect(stillCached.checkedAt).toBe(first.checkedAt);
+
+        // Once the interval elapses the CLI runs again.
+        yield* TestClock.adjust("5 minutes");
         const refreshed = yield* usage.probe;
         expect(invocations).toHaveLength(2);
-        expect(refreshed.checkedAt).toBe(isoAt(startMs + 6 * 60_000));
+        expect(refreshed.checkedAt).toBe(isoAt(startMs + 11 * 60_000));
       }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
@@ -422,7 +435,7 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
   );
 
   it.effect(
-    "invalidateCache bypasses the 5m TTL while keeping the last good reading on transient failure",
+    "invalidateCache keeps the last reading until the CLI interval elapses, then falls back on failure",
     () =>
       Effect.gen(function* () {
         const startMs = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-24T17:00:00Z"));
@@ -450,11 +463,16 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
         yield* TestClock.adjust("10 seconds");
         mode = "second";
         yield* usage.invalidateCache;
+        const cached = yield* usage.probe;
+        expect(calls).toBe(1);
+        expect(cached.windows).toEqual(initial.windows);
+
+        yield* TestClock.adjust("10 minutes");
         const refreshed = yield* usage.probe;
         expect(calls).toBe(2);
         expect(refreshed.windows[0]?.usedPercent).toBe(50);
 
-        yield* TestClock.adjust("10 seconds");
+        yield* TestClock.adjust("10 minutes");
         mode = "fail";
         yield* usage.invalidateCache;
         const fallback = yield* usage.probe;
@@ -469,6 +487,17 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
       const profileDirectory = yield* createProfileWithCliToken("before@example.com");
+      const refreshed = JSON.stringify({
+        token: {
+          access_token: "refreshed-access",
+          token_type: "Bearer",
+          refresh_token: "refresh",
+          expiry: "2026-11-24T19:00:00+08:00",
+          expires_in: 3599,
+        },
+        auth_method: "consumer",
+        id_token_email: "before@example.com",
+      });
       let ran = 0;
 
       const usage = yield* makeAntigravityUsageProbe({
@@ -483,7 +512,7 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
               "antigravity-cli",
               "antigravity-oauth-token",
             );
-            yield* fs.writeFileString(tokenPath, tokenFile("after@example.com")).pipe(Effect.orDie);
+            yield* fs.writeFileString(tokenPath, refreshed).pipe(Effect.orDie);
             return SAMPLE_CLI_JSON;
           }),
       });
@@ -491,10 +520,71 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
       const limits = yield* usage.probe;
       expect(ran).toBe(1);
       const stored = yield* fs.readFileString(profileTokenPath(path, profileDirectory));
-      expect(antigravityTokenEmail(stored)).toBe("after@example.com");
+      expect(stored).toBe(refreshed);
       expect(limits.credentialFingerprint).toBe(
-        yield* antigravityEmailFingerprint("after@example.com"),
+        yield* antigravityEmailFingerprint("before@example.com"),
       );
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("refuses limits when the CLI authenticated as a different account", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const profileDirectory = yield* createProfileWithCliToken("profile@example.com");
+
+      const usage = yield* makeAntigravityUsageProbe({
+        profileDirectory,
+        authMethod: "oauth-personal",
+        runCliUsage: (args) =>
+          Effect.gen(function* () {
+            const tokenPath = path.join(
+              args.cwd,
+              ".gemini",
+              "antigravity-cli",
+              "antigravity-oauth-token",
+            );
+            yield* fs.writeFileString(tokenPath, tokenFile("other@example.com"));
+            const logIndex = args.args?.indexOf("--log-file") ?? -1;
+            const logPath = logIndex >= 0 ? args.args?.[logIndex + 1] : undefined;
+            if (logPath !== undefined) {
+              yield* fs.writeFileString(
+                logPath,
+                "I1126 20:00:00.000000 1 server_oauth.go:221] applyAuthResult: email=other@example.com, authMethod=consumer\n",
+              );
+            }
+            return SAMPLE_CLI_JSON;
+          }).pipe(Effect.orDie),
+      });
+
+      const limits = yield* usage.probe;
+      expect(limits.unavailable?.reason).toBe("probeFailed");
+      expect(limits.unavailable?.message).toContain("different Google account");
+      expect(limits.windows ?? []).toEqual([]);
+      const stored = yield* fs.readFileString(profileTokenPath(path, profileDirectory));
+      expect(antigravityTokenEmail(stored)).toBe("profile@example.com");
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("reuses the cached reading instead of relaunching the CLI within the interval", () =>
+    Effect.gen(function* () {
+      const profileDirectory = yield* createProfileWithCliToken("user@example.com");
+      let runs = 0;
+
+      const usage = yield* makeAntigravityUsageProbe({
+        profileDirectory,
+        authMethod: "oauth-personal",
+        runCliUsage: () =>
+          Effect.sync(() => {
+            runs++;
+          }).pipe(Effect.as(SAMPLE_CLI_JSON)),
+      });
+
+      const first = yield* usage.probe;
+      yield* usage.invalidateCache;
+      const second = yield* usage.probe;
+      expect(runs).toBe(1);
+      expect(second.windows).toEqual(first.windows);
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
@@ -552,14 +642,15 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
         const limits = yield* usage.probe;
         expect(limits.unavailable).toBeUndefined();
         expect(invocations).toHaveLength(1);
-        expect(invocations[0]?.args).toEqual([
+        expect(invocations[0]?.args?.slice(0, 4)).toEqual([
           "-p",
           "/usage",
           "--output-format",
           "json",
-          "--project",
-          "enterprise-proj",
         ]);
+        expect(invocations[0]?.args?.[4]).toBe("--log-file");
+        expect(invocations[0]?.args?.[5]?.endsWith("usage-cli.log")).toBe(true);
+        expect(invocations[0]?.args?.slice(6)).toEqual(["--project", "enterprise-proj"]);
         expect(invocations[0]?.env.GOOGLE_CLOUD_PROJECT).toBe("enterprise-proj");
         expect(invocations[0]?.env.GOOGLE_CLOUD_LOCATION).toBe("us-central1");
         // Enterprise accounts keep OS-keyring sign-ins, so file storage is not forced there.
@@ -604,7 +695,7 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
-  it.effect("applies a 60s cooldown floor after failed attempts without re-spawning the CLI", () =>
+  it.effect("applies a 5m cooldown floor after failed attempts without re-spawning the CLI", () =>
     Effect.gen(function* () {
       const startMs = DateTime.toEpochMillis(DateTime.makeUnsafe("2026-11-24T17:00:00Z"));
       yield* TestClock.setTime(startMs);
@@ -629,7 +720,12 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
       expect(calls).toBe(1);
       expect(second.unavailable?.reason).toBe("probeFailed");
 
-      yield* TestClock.adjust("45 seconds");
+      yield* TestClock.adjust("3 minutes");
+      const third = yield* usage.probe;
+      expect(calls).toBe(1);
+      expect(third.unavailable?.reason).toBe("probeFailed");
+
+      yield* TestClock.adjust("2 minutes");
       yield* usage.probe;
       expect(calls).toBe(2);
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
