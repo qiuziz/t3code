@@ -190,5 +190,5 @@ jobs:
               --latest \
               --target "$GITHUB_SHA" \
               --title "T3 Code Custom ${version}" \
-              --notes "Custom macOS arm64 build: telemetry removed, local proxy defaults, Iris badge-fix theme, com.qiuz.t3code bundle id, stable self-signed code signature, and latest-mac.yml for in-app updates."
+              --notes "Custom macOS arm64 build: telemetry removed, local proxy defaults, Iris badge-fix theme, com.qiuz.t3code bundle id, stable code-signing requirement, and latest-mac.yml for in-app updates."
           fi
