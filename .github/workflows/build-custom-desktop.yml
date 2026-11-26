@@ -101,7 +101,7 @@ jobs:
         id: signing_identity_cache
         with:
           path: ${{ runner.temp }}/t3-signing
-          key: t3-custom-mac-signing-v2
+          key: t3-custom-mac-signing-v3
 
       # Follows upstream: apps/desktop/package.json holds the last synced release (0.1.12), and
       # each build appends -N so the app version stays monotonic for electron-updater.

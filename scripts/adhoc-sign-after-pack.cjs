@@ -9,8 +9,11 @@ const SIGNING_DIR = (process.env.T3CODE_MAC_SIGNING_DIR ?? "").trim() || os.tmpd
 const STABLE_KEY_PATH = path.join(SIGNING_DIR, "t3code-custom-desktop-signing.key");
 const STABLE_CERT_PATH = `${STABLE_KEY_PATH}.pem`;
 const STABLE_KEYCHAIN = path.join(SIGNING_DIR, "t3code-custom-desktop-signing.keychain-db");
-// Non-empty because macOS rejects an empty-password PKCS#12 from OpenSSL as a bad MAC.
-const STABLE_P12_PASSWORD = "t3code-custom-signing";
+// Non-empty because macOS rejects an empty-password PKCS#12 from OpenSSL as a bad MAC, and a
+// passwordless keychain can make SecurityAgent prompt instead of failing.
+const STABLE_PASSWORD = "t3code-custom-signing";
+// A headless runner has nobody to answer a keychain prompt, so never wait forever.
+const COMMAND_TIMEOUT_MS = 120_000;
 const OPENSSL_CONFIG = `
 [req]
 prompt = no
@@ -26,13 +29,19 @@ extendedKeyUsage = critical,codeSigning
 `;
 
 const run = (args, failure) => {
-  const result = spawnSync(args[0], args.slice(1), { stdio: "inherit" });
-  if (result.status !== 0) throw new Error(failure);
+  const result = spawnSync(args[0], args.slice(1), {
+    stdio: "inherit",
+    timeout: COMMAND_TIMEOUT_MS,
+  });
+  if (result.error !== undefined || result.status !== 0) throw new Error(failure);
 };
 
 const capture = (args) => {
-  const result = spawnSync(args[0], args.slice(1), { encoding: "utf8" });
-  return result.status === 0 ? result.stdout.trim() : "";
+  const result = spawnSync(args[0], args.slice(1), {
+    encoding: "utf8",
+    timeout: COMMAND_TIMEOUT_MS,
+  });
+  return result.error === undefined && result.status === 0 ? result.stdout.trim() : "";
 };
 
 // An ad-hoc signature is keyed to each build's CDHash, so Full Disk Access and Keychain
@@ -86,7 +95,7 @@ function ensureStableSigningIdentity() {
         "-out",
         p12Path,
         "-passout",
-        `pass:${STABLE_P12_PASSWORD}`,
+        `pass:${STABLE_PASSWORD}`,
       ],
       "Failed to bundle the self-signed certificate with its key.",
     );
@@ -94,12 +103,12 @@ function ensureStableSigningIdentity() {
 
   if (!fs.existsSync(STABLE_KEYCHAIN)) {
     run(
-      ["security", "create-keychain", "-p", "", STABLE_KEYCHAIN],
+      ["security", "create-keychain", "-p", STABLE_PASSWORD, STABLE_KEYCHAIN],
       "Failed to create the desktop signing keychain.",
     );
   }
   run(
-    ["security", "unlock-keychain", "-p", "", STABLE_KEYCHAIN],
+    ["security", "unlock-keychain", "-p", STABLE_PASSWORD, STABLE_KEYCHAIN],
     "Failed to unlock the desktop signing keychain.",
   );
   run(
@@ -111,7 +120,7 @@ function ensureStableSigningIdentity() {
       "-k",
       STABLE_KEYCHAIN,
       "-P",
-      STABLE_P12_PASSWORD,
+      STABLE_PASSWORD,
       "-T",
       "/usr/bin/codesign",
       "-A",
@@ -127,31 +136,32 @@ function ensureStableSigningIdentity() {
       "apple-tool:,apple:,codesign:",
       "-s",
       "-k",
-      "",
+      STABLE_PASSWORD,
       STABLE_KEYCHAIN,
     ],
     "Failed to authorize codesign for the self-signed key.",
   );
 }
 
-/** Run `task` with the signing keychain visible to codesign, then restore the user's setup. */
+/** Run `task` with the signing keychain as the default, then restore the user's default. */
 function withSigningKeychain(task) {
-  const previousSearch = capture(["security", "list-keychains", "-d", "user"])
-    .split("\n")
-    .map((line) => line.trim().replace(/^"|"$/g, ""))
-    .filter(Boolean);
+  const previousDefault = capture(["security", "default-keychain", "-d", "user"])
+    .split("\n")[0]
+    .trim()
+    .replace(/^"|"$/g, "");
+  // The search list is left alone: changing it can make SecurityAgent prompt for the login
+  // keychain on a headless runner, which is what hung the first build.
   run(
-    ["security", "list-keychains", "-d", "user", "-s", STABLE_KEYCHAIN, ...previousSearch],
-    "Failed to add the desktop signing keychain to the search list.",
+    ["security", "default-keychain", "-s", STABLE_KEYCHAIN],
+    "Failed to select the desktop signing keychain.",
   );
   try {
     return task();
   } finally {
-    // codesign finds identities through the search list; the default keychain stays untouched.
-    if (previousSearch.length > 0) {
+    if (previousDefault) {
       run(
-        ["security", "list-keychains", "-d", "user", "-s", ...previousSearch],
-        "Failed to restore the keychain search list.",
+        ["security", "default-keychain", "-s", previousDefault],
+        "Failed to restore the default keychain.",
       );
     }
   }
@@ -163,7 +173,7 @@ module.exports = async (context) => {
 
   const appPath = path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`);
 
-  // Only CI opts in: a stable identity needs its own keychain in the search list, which must
+  // Only CI opts in: a stable identity needs its own keychain as the default, which must
   // never happen in a developer session. Local builds keep the ad-hoc signature.
   const signAdHoc = () => {
     run(["codesign", "--force", "--deep", "--sign", "-", appPath], "Ad-hoc signing failed");
