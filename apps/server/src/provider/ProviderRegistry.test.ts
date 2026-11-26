@@ -2241,6 +2241,35 @@ it.layer(
         skills: [],
       } as const satisfies ServerProvider;
 
+      it("shares an Antigravity model list with a sibling that never discovered one", () => {
+        const sibling = {
+          ...previousProvider,
+          instanceId: ProviderInstanceId.make("antigravity-work"),
+          displayName: "Antigravity Work",
+          status: "warning",
+          auth: { status: "unknown", type: "oauth-personal" },
+          models: [],
+        } satisfies ServerProvider;
+        const [, shared] = ProviderRegistry.shareAntigravityModels([previousProvider, sibling]);
+        assert.deepStrictEqual(
+          shared?.models.map((model) => model.slug),
+          previousProvider.models.map((model) => model.slug),
+        );
+        assert.equal(shared?.modelsRetained, true);
+
+        for (const keepEmpty of [
+          { ...sibling, auth: { status: "unauthenticated" as const } },
+          { ...sibling, installed: false },
+          { ...sibling, enabled: false },
+        ]) {
+          const [, untouched] = ProviderRegistry.shareAntigravityModels([
+            previousProvider,
+            keepEmpty,
+          ]);
+          assert.deepStrictEqual(untouched?.models, []);
+        }
+      });
+
       it("clears models after sign-out, disable, uninstall, or an empty successful refresh", () => {
         const emptyProvider = {
           ...previousProvider,

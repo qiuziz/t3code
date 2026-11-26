@@ -13,6 +13,8 @@ import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 
+import * as HostProcess from "@t3tools/shared/HostProcess";
+
 import {
   makeUnavailableUsageLimits,
   makeUsageLimits,
@@ -409,6 +411,7 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
   readonly gcpLocation?: string;
   readonly resolveExecutable?: Effect.Effect<string, AntigravityCliUsageError, Scope.Scope>;
   readonly environment?: NodeJS.ProcessEnv;
+  readonly platform?: NodeJS.Platform;
   readonly runCliUsage?: (
     args: AntigravityCliUsageRunInput,
   ) => Effect.Effect<string, AntigravityCliUsageError>;
@@ -448,6 +451,7 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
   });
 
   const read = Effect.gen(function* () {
+    const platform = input.platform ?? (yield* HostProcess.Platform);
     const startedGeneration = generation;
     const checkedAt = DateTime.formatIso(yield* DateTime.now);
     if (input.authMethod !== "oauth-personal" && input.authMethod !== "oauth-business") {
@@ -508,7 +512,10 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
           yield* fs.writeFileString(isolatedTokenPath, profileToken);
         }
         const cleanEnv = buildAntigravityCliUsageEnv(input.environment ?? process.env, {
-          isolatedHome,
+          // macOS resolves the login keychain from $HOME. A temporary home makes every probe show
+          // "Keychain Not Found" (Cancel / Reset to Defaults), so keep the real home and isolate
+          // GEMINI_HOME, which is what decides where the profile's credentials live.
+          ...(platform === "darwin" ? {} : { isolatedHome }),
           isolatedGeminiHome,
           ...(input.authMethod === "oauth-business" && input.gcpProject
             ? { gcpProject: input.gcpProject }

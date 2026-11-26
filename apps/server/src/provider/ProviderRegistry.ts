@@ -201,6 +201,34 @@ export function upsertProviderWorkspaceSnapshot(
   };
 }
 
+/**
+ * Antigravity instances learn their model catalog from a session, so an instance that never ran
+ * one would offer nothing while a signed-in sibling still has the agent's list. Share that list
+ * until the instance discovers its own; sign-out and uninstall keep their catalogs private.
+ */
+export const shareAntigravityModels = (
+  providers: ReadonlyArray<ServerProvider>,
+): ReadonlyArray<ServerProvider> => {
+  const antigravity = ProviderDriverKind.make("antigravity");
+  const bySlug = new Map<string, ServerProvider["models"][number]>();
+  for (const provider of providers) {
+    if (provider.driver !== antigravity || !provider.installed) continue;
+    if (!provider.enabled || provider.auth.status === "unauthenticated") continue;
+    for (const model of provider.models) bySlug.set(model.slug, model);
+  }
+  if (bySlug.size === 0) return providers;
+  const shared = [...bySlug.values()];
+  return providers.map((provider) =>
+    provider.driver === antigravity &&
+    provider.installed &&
+    provider.enabled &&
+    provider.models.length === 0 &&
+    provider.auth.status !== "unauthenticated"
+      ? { ...provider, models: [...shared], modelsRetained: true }
+      : provider,
+  );
+};
+
 const shouldRetainMissingProviderModels = (provider: ServerProvider): boolean => {
   if (provider.driver === ProviderDriverKind.make("pi")) {
     // Pi auth becomes known only after inventory discovery: empty means unauthenticated; failed/interactive discovery preserves unknown auth and cached models.
@@ -529,6 +557,7 @@ export const layer = Layer.effect(
         ),
       ),
     );
+    const bootProvidersWithSiblingModels = shareAntigravityModels(bootProviders);
     const initialManifest = yield* manifestService.current;
     const classifyCompatibility = (
       provider: ServerProvider,
@@ -540,7 +569,9 @@ export const layer = Layer.effect(
         ModelManifest.BUNDLED_MODEL_MANIFEST.compatibility,
       );
     const providersRef = yield* Ref.make<ReadonlyArray<ServerProvider>>(
-      bootProviders.map((provider) => classifyCompatibility(provider, initialManifest)),
+      bootProvidersWithSiblingModels.map((provider) =>
+        classifyCompatibility(provider, initialManifest),
+      ),
     );
     const workspaceRefreshesRef = yield* Ref.make<
       ReadonlyMap<ProviderInstance, ReadonlyMap<string, Deferred.Deferred<void>>>

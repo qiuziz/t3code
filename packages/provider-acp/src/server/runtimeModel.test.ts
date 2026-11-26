@@ -13,6 +13,7 @@ import {
   parseSessionModeState,
   parseSessionUpdateEvent,
   sessionModelStateFromInitialize,
+  isReplayedCompleteMessage,
   sessionUpdateCountsAsLoadReplayActivity,
   sessionUpdateIsReplay,
   syntheticLoadSessionResponseFromInitialize,
@@ -43,6 +44,38 @@ describe("AcpRuntimeModel", () => {
         { id: "code", name: "Code" },
       ],
     });
+  });
+
+  it("treats a complete message first projected in another turn as replayed history", () => {
+    expect(
+      isReplayedCompleteMessage({
+        complete: true,
+        seenTurnId: "turn:14",
+        currentTurnId: "turn:22",
+      }),
+    ).toBe(true);
+    // Streaming chunks keep their id inside the turn, and the first sighting is always live.
+    expect(
+      isReplayedCompleteMessage({
+        complete: false,
+        seenTurnId: "turn:14",
+        currentTurnId: "turn:22",
+      }),
+    ).toBe(false);
+    expect(
+      isReplayedCompleteMessage({
+        complete: true,
+        seenTurnId: undefined,
+        currentTurnId: "turn:22",
+      }),
+    ).toBe(false);
+    expect(
+      isReplayedCompleteMessage({
+        complete: true,
+        seenTurnId: "turn:22",
+        currentTurnId: "turn:22",
+      }),
+    ).toBe(false);
   });
 
   it("detects Grok session replay updates from _meta.isReplay", () => {

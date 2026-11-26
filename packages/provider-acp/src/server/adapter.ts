@@ -95,6 +95,7 @@ import {
   mergeToolCallState,
   parsePermissionRequest,
   parseSessionUpdateEvent,
+  isReplayedCompleteMessage,
   sessionUpdateIsReplay,
   toolCallVisibleOutputChanged,
   withTrackedPermissionToolCall,
@@ -2360,6 +2361,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           input.runtimePolicy;
         const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
         const activeTurn = yield* Ref.make<ActiveAcpTurn | null>(null);
+        // CodeBuddy replays its conversation inside a prompt without `_meta.isReplay`. Replayed
+        // messages keep their native ids, so a complete message already projected in another turn
+        // is history and must not become a second item in the current run.
+        const projectedMessageTurns = yield* Ref.make(new Map<string, string>());
         // Keyed by the agent's steer id; an injection can arrive before its send returns.
         const steerInjections = new Map<string, Deferred.Deferred<void>>();
         const steerInjection = (steerId: string) => {
@@ -7379,6 +7384,37 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 yield* projectExtractedContextUsage(normalized, false);
                 yield* recordLoadedHistory(normalized, false);
                 return;
+              }
+              const messageUpdate = rawNotification.update;
+              if (
+                (messageUpdate.sessionUpdate === "agent_message" ||
+                  messageUpdate.sessionUpdate === "agent_message_chunk" ||
+                  messageUpdate.sessionUpdate === "user_message" ||
+                  messageUpdate.sessionUpdate === "user_message_chunk") &&
+                messageUpdate.messageId != null
+              ) {
+                const messageId = messageUpdate.messageId;
+                const context = yield* Ref.get(activeTurn);
+                const currentTurnId =
+                  context !== null && context.nativeThreadId === rawNotification.sessionId
+                    ? context.providerTurnId
+                    : "";
+                const seenTurn = (yield* Ref.get(projectedMessageTurns)).get(messageId);
+                const complete =
+                  messageUpdate.sessionUpdate === "agent_message" ||
+                  messageUpdate.sessionUpdate === "user_message";
+                if (isReplayedCompleteMessage({ complete, seenTurnId: seenTurn, currentTurnId })) {
+                  const normalized =
+                    flavor.normalizeSessionUpdate?.(rawNotification) ?? rawNotification;
+                  yield* projectExtractedContextUsage(normalized, false);
+                  yield* recordLoadedHistory(normalized, false);
+                  return;
+                }
+                if (seenTurn === undefined) {
+                  yield* Ref.update(projectedMessageTurns, (seen) =>
+                    new Map(seen).set(messageId, currentTurnId),
+                  );
+                }
               }
               yield* notePromptProgress(rawNotification);
               const nativePromptId = flavor.forkFromTurn?.nativeTurnId(rawNotification);

@@ -282,6 +282,7 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
         const usage = yield* makeAntigravityUsageProbe({
           profileDirectory,
           authMethod: "oauth-personal",
+          platform: "linux",
           resolveExecutable: Effect.acquireRelease(Effect.succeed("/usr/local/bin/agy"), () =>
             Effect.sync(() => {
               leaseReleasedAfterRun = true;
@@ -350,6 +351,35 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
       }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
+  it.effect(
+    "keeps the real home on macOS so the login keychain resolves, while still isolating GEMINI_HOME",
+    () =>
+      Effect.gen(function* () {
+        const profileDirectory = yield* createProfileWithCliToken();
+        const invocations: AntigravityCliUsageRunInput[] = [];
+
+        const usage = yield* makeAntigravityUsageProbe({
+          profileDirectory,
+          authMethod: "oauth-personal",
+          platform: "darwin",
+          environment: { PATH: "/usr/local/bin", HOME: "/Users/example" },
+          resolveExecutable: Effect.succeed("/usr/local/bin/agy"),
+          runCliUsage: (args) =>
+            Effect.sync(() => {
+              invocations.push(args);
+              return SAMPLE_CLI_JSON;
+            }),
+        });
+
+        yield* usage.probe;
+        expect(invocations).toHaveLength(1);
+        // A temp HOME makes macOS report "Keychain Not Found" on every probe.
+        expect(invocations[0]?.env.HOME).toBe("/Users/example");
+        expect(invocations[0]?.env.GEMINI_HOME).not.toBe(profileDirectory);
+        expect(invocations[0]?.env.AGY_CLI_FORCE_FILE_TOKEN_STORAGE).toBe("1");
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
   it.effect("writes a token refreshed by the CLI back to the profile", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -369,7 +399,7 @@ describe("makeAntigravityUsageProbe (official CLI)", () => {
               "antigravity-cli",
               "antigravity-oauth-token",
             );
-            yield* fs.writeFileString(tokenPath, tokenFile("after@example.com"));
+            yield* fs.writeFileString(tokenPath, tokenFile("after@example.com")).pipe(Effect.orDie);
             return SAMPLE_CLI_JSON;
           }),
       });

@@ -1319,6 +1319,18 @@ export function parsePermissionRequest(
   };
 }
 
+/**
+ * Agents such as CodeBuddy replay their conversation inside a prompt without `_meta.isReplay`.
+ * A replayed message keeps its native id, so a complete message first projected in another turn
+ * is history and must not become a second item in the current run.
+ */
+export const isReplayedCompleteMessage = (input: {
+  readonly complete: boolean;
+  readonly seenTurnId: string | undefined;
+  readonly currentTurnId: string;
+}): boolean =>
+  input.complete && input.seenTurnId !== undefined && input.seenTurnId !== input.currentTurnId;
+
 export function sessionUpdateIsReplay(params: EffectAcpSchema.SessionNotification): boolean {
   const meta = params._meta;
   return isRecord(meta) && meta.isReplay === true;
