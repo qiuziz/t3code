@@ -16,6 +16,8 @@ on:
       - "packages/**"
       - "native/**"
       - "scripts/build-desktop-artifact.ts"
+      - "scripts/adhoc-sign-after-pack.cjs"
+      - "scripts/prepare-server-compile-cache.cjs"
       - "package.json"
       - "pnpm-lock.yaml"
   workflow_dispatch:

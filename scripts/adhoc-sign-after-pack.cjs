@@ -30,10 +30,15 @@ extendedKeyUsage = critical,codeSigning
 
 const run = (args, failure) => {
   const result = spawnSync(args[0], args.slice(1), {
-    stdio: "inherit",
+    encoding: "utf8",
     timeout: COMMAND_TIMEOUT_MS,
   });
-  if (result.error !== undefined || result.status !== 0) throw new Error(failure);
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  if (result.error !== undefined || result.status !== 0) {
+    const detail = (result.stderr || result.stdout || "").trim().slice(-400);
+    throw new Error(detail === "" ? failure : `${failure}: ${detail}`);
+  }
 };
 
 const capture = (args) => {
@@ -63,9 +68,16 @@ function prepareSigningKeychain() {
 }
 
 function ensureStableSigningIdentity() {
-  const identities = // Not `-v`: a self-signed identity is usable for signing but is not a "valid" identity.
-    capture(["security", "find-identity", "-p", "codesigning"]);
-  if (identities.includes(`"${STABLE_IDENTITY}"`)) return;
+  // Ask the keychain directly: the identity need not be the default or a "valid" identity yet.
+  const imported = capture([
+    "security",
+    "find-certificate",
+    "-c",
+    STABLE_IDENTITY,
+    "-k",
+    STABLE_KEYCHAIN,
+  ]);
+  if (fs.existsSync(STABLE_KEYCHAIN) && imported !== "") return;
 
   const p12Path = `${STABLE_KEY_PATH}.p12`;
   if (!fs.existsSync(STABLE_KEY_PATH) || !fs.existsSync(STABLE_CERT_PATH)) {
@@ -189,9 +201,11 @@ module.exports = async (context) => {
     return;
   }
 
+  // Import while the keychain is not the default: that is the headless-friendly path, and
+  // SecurityAgent never has to authorize the login keychain.
   prepareSigningKeychain();
+  ensureStableSigningIdentity();
   withSigningKeychain(() => {
-    ensureStableSigningIdentity();
     run(
       ["codesign", "--force", "--deep", "--sign", STABLE_IDENTITY, appPath],
       "Stable self-signing failed",
