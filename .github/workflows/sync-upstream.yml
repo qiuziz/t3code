@@ -93,6 +93,16 @@ jobs:
           esac
           git switch -c "${branch}"
           if git merge --no-edit "${TARGET}"; then
+            # Keep the fork's build base at the upstream release we just merged; the desktop
+            # build appends -N for each build so electron-updater sees a monotonic version.
+            version="${TARGET#v}"
+            if [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              perl -pi -e "s/\"version\": \"[^\"]*\"/\"version\": \"${version}\"/" apps/desktop/package.json
+              if ! git diff --quiet -- apps/desktop/package.json; then
+                git add apps/desktop/package.json
+                git commit -m "chore(release): set fork base version to ${version}"
+              fi
+            fi
             echo "conflict=false" >> "$GITHUB_OUTPUT"
             echo "branch=${branch}" >> "$GITHUB_OUTPUT"
             # A previous run may have pushed this branch and then failed before merging the

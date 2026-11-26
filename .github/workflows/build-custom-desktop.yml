@@ -1,11 +1,10 @@
 name: Build custom desktop
 
 # Builds this fork's macOS (Apple Silicon) DMG on demand and on pushes that touch the
-# desktop app itself. sync-upstream.yml dispatches this workflow explicitly after each
-# upstream release merge, so `paths` only filters direct pushes; it does not gate dispatch.
-# Workspace packages (apps/web, apps/server, packages/**) are intentionally absent: their
-# changes ship with the next release merge rather than triggering a build of their own.
-# The bundle is built once, then packaged; the DMG and a draft release are published.
+# desktop app, the bundled server, or the packaging scripts. sync-upstream.yml dispatches
+# this workflow explicitly after each upstream release merge, so `paths` only filters direct
+# pushes; it does not gate dispatch. The bundle is built once, then packaged; the DMG,
+# latest-mac.yml, and a published release for in-app updates are produced.
 
 on:
   push:
@@ -13,6 +12,8 @@ on:
     paths:
       - ".github/workflows/build-custom-desktop.yml"
       - "apps/desktop/**"
+      - "apps/server/**"
+      - "packages/**"
       - "native/**"
       - "scripts/build-desktop-artifact.ts"
       - "package.json"
@@ -95,15 +96,60 @@ jobs:
         if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
         run: rustup target add aarch64-apple-darwin
 
+      - name: Cache stable macOS self-signing identity
+        uses: actions/cache@v4
+        id: signing_identity_cache
+        with:
+          path: ${{ runner.temp }}/t3-signing
+          key: t3-custom-mac-signing-v2
+
+      # Follows upstream: apps/desktop/package.json holds the last synced release (0.1.12), and
+      # each build appends -N so the app version stays monotonic for electron-updater.
+      - name: Compute fork build version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base="$(node -p "require('./apps/desktop/package.json').version.split('-')[0]")"
+          last=0
+          while read -r tag; do
+            if [[ "$tag" =~ ^v${base//./\\.}-([0-9]+)$ ]]; then
+              n="${BASH_REMATCH[1]}"
+              [ "$n" -gt "$last" ] && last="$n"
+            fi
+          done < <(gh release list --limit 100 --json tagName --jq '.[].tagName')
+          version="${base}-$((last + 1))"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Fork build version: ${version}"
+
       - name: Build desktop bundle
         run: vp run build:desktop:bundle
 
       - name: Package macOS arm64 DMG
         env:
-          # This fork ships unsigned; do not look for a local signing identity.
+          # A cached self-signed identity keeps the designated requirement (and TCC grants) stable.
+          T3CODE_MAC_SIGNING_DIR: ${{ runner.temp }}/t3-signing
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
           T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: ${{ steps.resource_monitor_cache.outputs.cache-hit == 'true' }}
-        run: vp run dist:desktop:artifact --platform mac --target dmg --arch arm64 --skip-build
+        run: vp run dist:desktop:artifact --platform mac --target dmg --arch arm64 --skip-build --build-version "${{ steps.version.outputs.version }}"
+
+      - name: Stage updater manifests for release
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          if [ ! -f release/latest-mac.yml ]; then
+            for yml in release/**/latest-mac.yml release/**/latest-mac-*.yml; do
+              [ -f "$yml" ] || continue
+              cp "$yml" "release/$(basename "$yml")"
+              break
+            done
+          fi
+          if [ ! -f release/latest-mac.yml ]; then
+            echo "::error::No latest-mac.yml produced by electron-builder."
+            find release -maxdepth 4 -name '*.yml' -print
+            exit 1
+          fi
 
       # Keep Actions artifact storage tiny (Free plan 500 MB). Binaries live on the release only.
       - name: Write release checksum manifest
@@ -112,7 +158,7 @@ jobs:
           shopt -s nullglob
           mkdir -p release/checksums
           {
-            echo "version=$(node -p "require('./apps/desktop/package.json').version")"
+            echo "version=${{ steps.version.outputs.version }}"
             echo "sha=${GITHUB_SHA}"
             echo "built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > release/checksums/build-metadata.txt
@@ -130,26 +176,26 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-      - name: Publish draft release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          files=(release/*.dmg release/*.zip)
+          files=(release/*.dmg release/*.zip release/latest-mac.yml release/latest-mac-*.yml)
           if [[ ${#files[@]} -eq 0 ]]; then
             echo "::error::No desktop artifacts were produced."
             exit 1
           fi
-          version="$(node -p "require('./apps/desktop/package.json').version")"
-          day="$(date -u +%Y%m%d)"
-          tag="v${version}-custom-${day}"
+          version="${VERSION}"
+          tag="v${version}"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "${files[@]}" --clobber
           else
             gh release create "$tag" "${files[@]}" \
-              --draft \
+              --latest \
               --target "$GITHUB_SHA" \
-              --title "T3 Code Custom ${version} (${day})" \
-              --notes "Custom macOS arm64 build: telemetry removed, local proxy defaults built in, and the Iris badge-fix theme and custom bundle identifier (com.qiuz.t3code) applied. Unsigned."
+              --title "T3 Code Custom ${version}" \
+              --notes "Custom macOS arm64 build: telemetry removed, local proxy defaults, Iris badge-fix theme, com.qiuz.t3code bundle id, stable self-signed code signature, and latest-mac.yml for in-app updates."
           fi
