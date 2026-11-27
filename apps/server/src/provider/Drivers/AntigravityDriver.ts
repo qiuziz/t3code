@@ -50,9 +50,11 @@ import {
 } from "../antigravityAuthSupport.ts";
 import {
   antigravityModelOptions,
+  antigravityServesT3Code,
   antigravitySessionMode,
   antigravityThinkingConfig,
   makeAntigravityAcpRuntime,
+  OPEN_MODEL_ACCESS_RELEASE,
   type AntigravityAcpRuntimeInput,
 } from "../acp/AntigravityAcpSupport.ts";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
@@ -72,10 +74,8 @@ import { ProviderDriverError } from "../Errors.ts";
 import { makeAntigravityProvider } from "../AntigravityProvider.ts";
 import {
   antigravityTokenEmail,
-  AntigravityCliUsageError,
-  makeAntigravityUsageProbe,
-} from "../antigravityUsageLimits.ts";
-import { readAntigravityAcpLogEmail } from "../antigravityAccountIdentity.ts";
+  readAntigravityAcpLogEmail,
+} from "../antigravityAccountIdentity.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
 import {
@@ -351,7 +351,6 @@ export const AntigravityDriver: ProviderDriver<
       );
       const runtime = yield* makeAntigravityAcpRuntime({
         ...runtimeInput,
-        runtimeVersion: executable.version,
         authMethod: auth.authMethod,
         childProcessSpawner: spawner,
         spawn,
@@ -360,18 +359,20 @@ export const AntigravityDriver: ProviderDriver<
       const startCompatible = Effect.fn("AntigravityDriver.startCompatible")(function* () {
         const version = (yield* runtime.initialize()).agentInfo?.version;
         const advisory = version ? yield* installation.compatibility(version) : undefined;
-        const refused =
-          version &&
-          brokenRuntimeError({
-            instanceId,
-            name: "Antigravity",
-            version,
-            advisory,
-            action:
-              executable.source === "managed"
-                ? "Update it in Antigravity setup"
-                : `Update the Antigravity executable at ${executable.executablePath}`,
-          });
+        const action =
+          executable.source === "managed"
+            ? "Update it in Antigravity setup"
+            : `Update the Antigravity executable at ${executable.executablePath}`;
+        const refused = !version
+          ? undefined
+          : (brokenRuntimeError({ instanceId, name: "Antigravity", version, advisory, action }) ??
+            (antigravityServesT3Code(version)
+              ? undefined
+              : new ProviderSetupError({
+                  instanceId,
+                  operation: "runtime",
+                  detail: `Antigravity ${version} only serves allowlisted editors, not T3 Code. ${action} to ${OPEN_MODEL_ACCESS_RELEASE.join(".")} or newer, then retry.`,
+                })));
         if (refused) {
           return yield* new AcpErrors.AcpTransportError({ detail: refused.detail, cause: refused });
         }
@@ -529,7 +530,7 @@ export const AntigravityDriver: ProviderDriver<
           return Deferred.succeed(event.acknowledge, undefined).pipe(Effect.asVoid);
         }
         if (event._tag === "ConfigOptionsUpdated") {
-          return provider.onConfigOptionsUpdated(event.configOptions);
+          return provider.onConfigOptionsUpdated(event.configOptions, { fromCatalogProbe: true });
         }
         return event._tag === "AvailableCommandsUpdated"
           ? provider.onAvailableCommands(event.availableCommands)
@@ -549,11 +550,7 @@ export const AntigravityDriver: ProviderDriver<
     const authFlow: AntigravityAuth = yield* makeAntigravityAuth({
       instanceId,
       makeRuntime: makeDisposableRuntime,
-      // A new sign-in may be another account; drop any in-flight quota read first.
-      onAuthenticated: (started, runtime) =>
-        Effect.suspend(() => provider.onSignedIn).pipe(
-          Effect.andThen(publishCatalog(started, runtime)),
-        ),
+      onAuthenticated: publishCatalog,
       onSignedOut: Effect.suspend(() => provider.onSignedOut),
       usesBrowser: antigravityAuthUsesBrowser(auth.authMethod),
       codeLogin,
@@ -598,35 +595,10 @@ export const AntigravityDriver: ProviderDriver<
       };
     });
 
-    const usage = yield* makeAntigravityUsageProbe({
-      profileDirectory,
-      authMethod: auth.authMethod,
-      gcpProject: auth.gcpProject,
-      gcpLocation: auth.gcpLocation,
-      environment: processEnvironment,
-      spawner,
-      resolveExecutable: installation.acquire(settings.binaryPath, processEnvironment).pipe(
-        Effect.map((resolved) => resolved.executablePath),
-        Effect.mapError(
-          (cause) =>
-            new AntigravityCliUsageError({
-              reason: "resolve_executable",
-              cause,
-            }),
-        ),
-      ),
-    }).pipe(
-      Effect.provideService(FileSystem.FileSystem, fileSystem),
-      Effect.provideService(Path.Path, path),
-      Effect.provideService(Digest.Digest, digest),
-    );
     const provider = yield* makeAntigravityProvider(settings, {
       environment: processEnvironment,
       stampIdentity: classifyModels,
       probe,
-      probeUsage: usage.probe,
-      invalidateUsageCache: usage.invalidateCache,
-      clearUsage: usage.clear,
       ...(accountIdentity ? { accountIdentity } : {}),
       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
       ...(rememberedRuntimeModes ? { rememberedRuntimeModes } : {}),
@@ -668,8 +640,10 @@ export const AntigravityDriver: ProviderDriver<
         ),
       ),
       profileDirectory,
-      onSessionStarted: (started, cwd) =>
-        provider.onSessionStarted(started, cwd).pipe(Effect.andThen(authFlow.onSignedInElsewhere)),
+      onSessionStarted: (started, cwd, session) =>
+        provider
+          .onSessionStarted(started, cwd, session)
+          .pipe(Effect.andThen(authFlow.onSignedInElsewhere)),
       onSessionEvent: (event, cwd) => {
         if (event._tag === "ConfigOptionsUpdated") {
           return provider.onConfigOptionsUpdated(event.configOptions);

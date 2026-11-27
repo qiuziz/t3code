@@ -5,9 +5,24 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
 import {
+  antigravityTokenEmail,
   parseAntigravityAuthEmail,
   readAntigravityAcpLogEmail,
 } from "./antigravityAccountIdentity.ts";
+
+describe("antigravityTokenEmail", () => {
+  it("reads the account recorded in a profile token file", () => {
+    expect(antigravityTokenEmail(JSON.stringify({ id_token_email: "user@example.com" }))).toBe(
+      "user@example.com",
+    );
+  });
+
+  it("ignores malformed tokens", () => {
+    expect(antigravityTokenEmail(undefined)).toBeUndefined();
+    expect(antigravityTokenEmail("not json")).toBeUndefined();
+    expect(antigravityTokenEmail(JSON.stringify({ token: {} }))).toBeUndefined();
+  });
+});
 
 describe("parseAntigravityAuthEmail", () => {
   it("reads the last account agy authenticated as", () => {
