@@ -5,7 +5,6 @@ import {
   type UsageLimitSourceAccount,
   type UsageLimitSourceConfig,
 } from "@t3tools/contracts";
-import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Cause from "effect/Cause";
 import * as Digest from "effect/crypto/Digest";
 import * as DateTime from "effect/DateTime";
@@ -37,7 +36,6 @@ const AuthFile = Schema.Struct({
   provider: Schema.String,
   email: Schema.optional(Schema.String),
   disabled: Schema.optional(Schema.Boolean),
-  project_id: Schema.optional(Schema.String),
   id_token: Schema.optional(
     Schema.Struct({
       chatgpt_account_id: Schema.optional(Schema.String),
@@ -197,16 +195,12 @@ type HubCall = (
 type HubReading = Omit<UsageLimitSourceAccount, "id" | "driver">;
 interface HubProvider {
   readonly driver: ProviderDriverKind;
-  readonly header: (
-    account: AuthFile,
-    platform: NodeJS.Platform,
-    architecture: NodeJS.Architecture,
-  ) => Record<string, string>;
+  readonly header: (account: AuthFile) => Record<string, string>;
   readonly read: (input: {
     readonly account: AuthFile;
     readonly call: HubCall;
     readonly checkedAt: string;
-  }) => Effect.Effect<HubReading, UsageLimitSourceError | Schema.SchemaError, Digest.Digest>;
+  }) => Effect.Effect<HubReading, UsageLimitSourceError | Schema.SchemaError>;
 }
 
 const listedIdentity = (account: AuthFile) => ({
@@ -358,8 +352,6 @@ const HUB_PROVIDERS = new Map<string, HubProvider>([
 export const makeCliproxyApi = Effect.gen(function* () {
   const client = yield* HttpClient.HttpClient;
   const digest = yield* Digest.Digest;
-  const platform = yield* HostProcess.Platform;
-  const architecture = yield* HostProcess.Architecture;
 
   const management = Effect.fn("CliproxyApi.management")(function* (
     hub: CliproxyHub,
@@ -439,10 +431,8 @@ export const makeCliproxyApi = Effect.gen(function* () {
     provider: HubProvider,
   ) {
     const checkedAt = DateTime.formatIso(yield* DateTime.now);
-    const call: HubCall = (url, data) =>
-      apiCall(hub, account, provider.header(account, platform, architecture), url, data);
+    const call: HubCall = (url, data) => apiCall(hub, account, provider.header(account), url, data);
     const reading = yield* provider.read({ account, call, checkedAt }).pipe(
-      Effect.provideService(Digest.Digest, digest),
       Effect.catch((error) =>
         Effect.succeed({
           ...listedIdentity(account),
@@ -514,7 +504,7 @@ export const makeCliproxyApi = Effect.gen(function* () {
       const body = yield* apiCall(
         hub,
         account,
-        CODEX_HUB.header(account, platform, architecture),
+        CODEX_HUB.header(account),
         `${CREDIT_URL}/consume`,
         {
           redeem_request_id: yield* creditRedeemRequestId(

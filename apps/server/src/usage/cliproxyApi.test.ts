@@ -520,7 +520,7 @@ describe("CLIProxyAPI built-in management API", () => {
   ])("reports $name as unreadable", ({ provider, status, body }) =>
     Effect.gen(function* () {
       const test = fixture({
-        accounts: [{ id: `${provider}.json`, auth_index: "a", provider, project_id: "project-7" }],
+        accounts: [{ id: `${provider}.json`, auth_index: "a", provider }],
         upstream: () => ({ status, body }),
       });
       const [account] = yield* (yield* test.api).readAccounts(config);
@@ -533,6 +533,8 @@ describe("CLIProxyAPI built-in management API", () => {
       const test = fixture({
         accounts: [
           { id: "kiro.json", auth_index: "k", provider: "kiro", email: "k@example.com" },
+          // Antigravity only allows ACP clients, so its internal quota API is never called.
+          { id: "antigravity.json", auth_index: "g", provider: "antigravity", project_id: "p" },
           { ...accounts[0]!, provider: "claude" },
         ],
         upstream: () => ({ status: 200, body: { five_hour: { utilization: 1, resets_at: null } } }),
@@ -540,6 +542,7 @@ describe("CLIProxyAPI built-in management API", () => {
       const result = yield* (yield* test.api).readAccounts(config);
       expect(result.map((account) => account.driver)).toEqual(["claudeAgent"]);
       expect(test.requests.map((request) => request.body?.auth_index)).not.toContain("k");
+      expect(test.requests.map((request) => request.body?.auth_index)).not.toContain("g");
     }),
   );
 

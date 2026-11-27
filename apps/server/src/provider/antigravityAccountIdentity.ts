@@ -9,6 +9,19 @@ const ACP_LOG_PREFIX = "acp-server-";
 const ACP_LOG_SUFFIX = ".log";
 const MAX_LOG_TAIL_CHARS = 256 * 1024;
 
+/** The account a profile token file belongs to, as agy records it when signing in. */
+export function antigravityTokenEmail(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return undefined;
+    const email = (parsed as { id_token_email?: unknown }).id_token_email;
+    return typeof email === "string" && email.trim() ? email.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function parseAntigravityAuthEmail(output: string): string | undefined {
   let email: string | undefined;
   for (const match of output.matchAll(AUTH_EMAIL_PATTERN)) {
