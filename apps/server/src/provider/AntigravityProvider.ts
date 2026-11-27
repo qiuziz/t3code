@@ -376,16 +376,26 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             if (isStaleSignOut(state)) {
               return [false, state] as const;
             }
+            const nextLimits = resolveUsageLimitsAfterProbe({
+              published: state.draft.usageLimits,
+              probed,
+            });
+            // A cached successful read republishes identical limits; a full health check for that
+            // would double the provider's probe frequency. A failed read still republishes the
+            // retained limits, which is how a stale probe surfaces.
+            const unchangedSuccess =
+              probed?.unavailable === undefined &&
+              Equal.equals(nextLimits, state.draft.usageLimits);
+            if (unchangedSuccess) {
+              return [false, state] as const;
+            }
             return [
               true,
               {
                 ...state,
                 draft: {
                   ...state.draft,
-                  usageLimits: resolveUsageLimitsAfterProbe({
-                    published: state.draft.usageLimits,
-                    probed,
-                  }),
+                  usageLimits: nextLimits,
                 },
               },
             ] as const;

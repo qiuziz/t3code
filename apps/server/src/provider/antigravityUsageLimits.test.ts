@@ -395,6 +395,53 @@ describe("makeAntigravityUsageProbe", () => {
     }),
   );
 
+  it.effect("a manual refresh clears the sign-in hold", () =>
+    Effect.gen(function* () {
+      let spawns = 0;
+      let signedOut = true;
+      const spawner = ChildProcessSpawner.make(() => {
+        spawns++;
+        return Effect.succeed(
+          makeMockHandle(
+            signedOut
+              ? { stderr: "Authentication required. Please visit the URL to log in:" }
+              : { stdout: SAMPLE_USAGE_STDOUT },
+          ),
+        );
+      });
+      const usage = yield* makeAntigravityUsageProbe({
+        authMethod: "oauth-personal",
+        profileDirectory: makeProfileDirectory(),
+        baseEnv: {},
+        resolveExecutable: Effect.succeed({
+          executablePath: "/opt/agy",
+          source: "managed",
+          version: "1.5.14",
+          managedVersionDirectory: null,
+        }),
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Layer.succeed(HostProcess.Platform, "linux"),
+          ),
+        ),
+      );
+      const first = yield* usage.probe;
+      expect(first.unavailable?.reason).toBe("probeFailed");
+      expect(spawns).toBe(1);
+
+      // Credentials became valid outside T3; a manual refresh must retry instead of staying held.
+      signedOut = false;
+      yield* usage.invalidateCache;
+      const second = yield* usage.probe;
+      expect(second.unavailable).toBeUndefined();
+      expect(second.windows).toHaveLength(4);
+      expect(spawns).toBe(2);
+    }),
+  );
+
   it.effect("latches off permanently for a binary that executes /usage as a model turn", () =>
     Effect.gen(function* () {
       let spawns = 0;
