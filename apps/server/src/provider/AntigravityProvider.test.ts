@@ -141,6 +141,7 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
     readonly enabled?: boolean;
     readonly safe?: boolean;
     readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits>;
+    readonly clearUsageHold?: Effect.Effect<void>;
     readonly rememberedRuntimeModes?: ReadonlyArray<RuntimeMode>;
     readonly accountIdentity?: {
       readonly expectedEmail: Effect.Effect<string | undefined>;
@@ -162,6 +163,7 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
       stampIdentity: (snapshot) => Effect.succeed({ ...snapshot, instanceId, driver }),
       ...(options.auth ? { auth: options.auth } : {}),
       ...(options.probeUsage ? { probeUsage: options.probeUsage } : {}),
+      ...(options.clearUsageHold ? { clearUsageHold: options.clearUsageHold } : {}),
       ...(options.rememberedRuntimeModes
         ? { rememberedRuntimeModes: options.rememberedRuntimeModes }
         : {}),
@@ -1068,6 +1070,29 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
       expect(snapshot.workspaceSnapshots?.[0]?.cwd).toBe("/workspace-3");
       expect(snapshot.slashCommands).toEqual(expectedCommands);
       expect(yield* Ref.get(harness.probeCalls)).toBe(1);
+    }),
+  );
+
+  it.effect("explicit refresh clears the usage hold, a turn refresh does not", () =>
+    Effect.gen(function* () {
+      const cleared = yield* Ref.make(0);
+      const harness = yield* makeHarness({
+        probeUsage: Effect.succeed({
+          checkedAt: "2026-10-09T12:00:00.000Z",
+          windows: [],
+        } satisfies ServerProviderUsageLimits),
+        clearUsageHold: Ref.update(cleared, (count) => count + 1),
+      });
+      yield* harness.initialize;
+
+      // The explicit refresh path (Usage/Provider refresh, provider retry after a broken runtime)
+      // must retry a held probe so an out-of-band sign-in is picked up without a restart.
+      yield* harness.provider.snapshot.refresh;
+      expect(yield* Ref.get(cleared)).toBe(1);
+
+      // Turn-end usage refreshes only invalidate the cache; they must not relaunch a held probe.
+      yield* harness.provider.snapshot.refreshUsage ?? Effect.void;
+      expect(yield* Ref.get(cleared)).toBe(1);
     }),
   );
 

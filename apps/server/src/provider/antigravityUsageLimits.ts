@@ -737,12 +737,15 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
 
   return {
     probe,
-    // Manual refresh drops the TTL, the failure cooldown, and the sign-in hold so credentials
-    // restored outside T3 are picked up; the per-interval floor still applies so the session's own
-    // token refresh is never raced.
+    // A manual refresh drops the TTL and the failure cooldown. The per-interval floor still applies
+    // once a successful read is cached, so the session's own token refresh is never raced.
     invalidateCache: Effect.sync(() => {
       if (cached !== undefined) cached = { ...cached, cachedAt: 0 };
       lastAttemptAtMs = 0;
+    }),
+    // Explicit refreshes can follow a sign-in that happened outside T3. Kept apart from
+    // invalidateCache so a turn-end refresh does not relaunch a held probe.
+    clearSignInHold: Effect.sync(() => {
       signedOutHoldPath = undefined;
     }),
     clear: Effect.sync(() => {

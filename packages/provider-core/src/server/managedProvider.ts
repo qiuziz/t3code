@@ -64,6 +64,8 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
   readonly checkProvider: Effect.Effect<ServerProvider, ServerSettingsError>;
   readonly checkUsageLimits?: Effect.Effect<ServerProvider["usageLimits"]>;
   readonly invalidateUsageCache?: Effect.Effect<void>;
+  /** Cleared on an explicit refresh, never on the periodic health interval. */
+  readonly clearUsageHold?: Effect.Effect<void>;
   readonly enrichSnapshot?: (input: {
     readonly settings: Settings;
     readonly snapshot: ServerProvider;
@@ -299,6 +301,9 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
 
   const refreshSnapshot = Effect.fn("refreshSnapshot")(function* () {
     const nextSettings = yield* input.getSettings;
+    // An explicit refresh can follow a sign-in that happened outside T3. The periodic check uses
+    // refreshOnInterval instead, so a held probe is not retried on a timer.
+    yield* input.clearUsageHold ?? Effect.void;
     return yield* applySnapshot(nextSettings, { forceRefresh: true });
   });
 
