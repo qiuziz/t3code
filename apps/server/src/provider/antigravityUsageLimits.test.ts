@@ -395,7 +395,7 @@ describe("makeAntigravityUsageProbe", () => {
     }),
   );
 
-  it.effect("a manual refresh clears the sign-in hold", () =>
+  it.effect("an explicit hold clear retries after an out-of-band sign-in", () =>
     Effect.gen(function* () {
       let spawns = 0;
       let signedOut = true;
@@ -432,13 +432,55 @@ describe("makeAntigravityUsageProbe", () => {
       expect(first.unavailable?.reason).toBe("probeFailed");
       expect(spawns).toBe(1);
 
-      // Credentials became valid outside T3; a manual refresh must retry instead of staying held.
+      // Credentials became valid outside T3; an explicit hold clear must retry.
       signedOut = false;
-      yield* usage.invalidateCache;
+      yield* usage.clearSignInHold;
       const second = yield* usage.probe;
       expect(second.unavailable).toBeUndefined();
       expect(second.windows).toHaveLength(4);
       expect(spawns).toBe(2);
+    }),
+  );
+
+  it.effect("a turn-end cache invalidation keeps the sign-in hold", () =>
+    Effect.gen(function* () {
+      let spawns = 0;
+      const spawner = ChildProcessSpawner.make(() => {
+        spawns++;
+        return Effect.succeed(
+          makeMockHandle({
+            stderr: "Authentication required. Please visit the URL to log in:",
+          }),
+        );
+      });
+      const usage = yield* makeAntigravityUsageProbe({
+        authMethod: "oauth-personal",
+        profileDirectory: makeProfileDirectory(),
+        baseEnv: {},
+        resolveExecutable: Effect.succeed({
+          executablePath: "/opt/agy",
+          source: "managed",
+          version: "1.5.14",
+          managedVersionDirectory: null,
+        }),
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Layer.succeed(HostProcess.Platform, "linux"),
+          ),
+        ),
+      );
+      const first = yield* usage.probe;
+      expect(first.unavailable?.reason).toBe("probeFailed");
+      expect(spawns).toBe(1);
+
+      // Turn-end refreshes invalidate the TTL; they must not relaunch a held probe.
+      yield* usage.invalidateCache;
+      const second = yield* usage.probe;
+      expect(second.unavailable?.reason).toBe("probeFailed");
+      expect(spawns).toBe(1);
     }),
   );
 

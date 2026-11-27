@@ -618,6 +618,7 @@ export const AntigravityDriver: ProviderDriver<
       ...(accountIdentity ? { accountIdentity } : {}),
       probeUsage: usage.probe,
       invalidateUsageCache: usage.invalidateCache,
+      clearUsageHold: usage.clearSignInHold,
       clearUsage: usage.clear,
       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
       ...(rememberedRuntimeModes ? { rememberedRuntimeModes } : {}),

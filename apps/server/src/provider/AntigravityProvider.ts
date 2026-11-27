@@ -218,6 +218,7 @@ interface AntigravityProviderOptions {
   };
   readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits>;
   readonly invalidateUsageCache?: Effect.Effect<void>;
+  readonly clearUsageHold?: Effect.Effect<void>;
   readonly clearUsage?: Effect.Effect<void>;
   readonly maintenanceCapabilities?: ProviderMaintenanceCapabilities;
   readonly auth?: { readonly type: string; readonly label: string };
@@ -526,6 +527,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     initialSnapshot: () => getSnapshot,
     checkProvider: checkProvider(),
     ...(options.invalidateUsageCache ? { invalidateUsageCache: options.invalidateUsageCache } : {}),
+    ...(options.clearUsageHold ? { clearUsageHold: options.clearUsageHold } : {}),
     enrichSnapshot: ({ publishSnapshot }) =>
       SubscriptionRef.changes(metadata).pipe(
         Stream.runForEach((state) =>
