@@ -15,7 +15,9 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
@@ -24,6 +26,7 @@ import type {
   AntigravityExecutable,
   AntigravityInstallationError,
 } from "./AntigravityInstallation.ts";
+import { antigravityTokenEmail, parseAntigravityAuthEmail } from "./antigravityAccountIdentity.ts";
 
 // Before agy 1.1.11, `/usage` in print mode ran as a billed model turn.
 const MIN_USAGE_CLI_VERSION = "1.1.11";
@@ -31,6 +34,12 @@ const VERSION_TIMEOUT = "5 seconds";
 const USAGE_PROBE_TIMEOUT = "30 seconds";
 const MAX_OUTPUT_BYTES = 512 * 1024;
 const CACHE_TTL_MS = 60_000;
+// Each probe run refreshes the profile's OAuth token, so a settled turn cannot relaunch the CLI
+// every minute without racing the session's own refresh.
+const MIN_CLI_INTERVAL_MS = 10 * 60_000;
+// Back off after a failed run instead of relaunching the CLI on every health check.
+const FAIL_COOLDOWN_MS = 5 * 60_000;
+const PROFILE_TOKEN_SEGMENTS = ["antigravity-acp", "antigravity-oauth-token"] as const;
 // Epoch-zero (`1970-01-01T00:00:00Z`) and pre-2000 values are sentinel timestamps for full pools.
 const MIN_VALID_RESET_MS = Date.UTC(2000, 0, 1);
 
@@ -75,6 +84,18 @@ const REMOVED_ENV_KEYS = new Set([
   "SSH_TTY",
   "SSH_AUTH_SOCK",
 ]);
+
+const IsolatedCliSettings = Schema.Struct({
+  trustedWorkspaces: Schema.Array(Schema.String),
+  onboardingComplete: Schema.Boolean,
+  colorScheme: Schema.String,
+});
+const IsolatedCliOnboarding = Schema.Struct({
+  onboardingComplete: Schema.Boolean,
+  completed: Schema.Boolean,
+});
+const encodeIsolatedCliSettings = Schema.encodeSync(Schema.fromJsonString(IsolatedCliSettings));
+const encodeIsolatedCliOnboarding = Schema.encodeSync(Schema.fromJsonString(IsolatedCliOnboarding));
 
 const CliBucket = Schema.Struct({
   id: Schema.optional(Schema.String),
@@ -265,7 +286,13 @@ function outputLooksSignedOut(output: string): boolean {
 
 function buildUsageCliEnv(
   baseEnv: NodeJS.ProcessEnv,
-  profileDirectory: string | undefined,
+  options: {
+    readonly authMethod: AntigravitySettings["authMethod"];
+    readonly isolatedHome?: string;
+    readonly isolatedGeminiHome?: string;
+    readonly gcpProject?: string;
+    readonly gcpLocation?: string;
+  },
 ): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(baseEnv)) {
@@ -280,11 +307,23 @@ function buildUsageCliEnv(
     }
     env[key] = value;
   }
-  // Bind CLI state/cache to the instance profile. Root `agy -p /usage` does not accept ACP's
-  // `--gemini-dir`/`--app-data-dir` flags, so GEMINI_HOME isolates its runtime directory while
-  // letting `agy` authenticate silently via the OS keyring.
-  if (profileDirectory) {
-    env.GEMINI_HOME = profileDirectory;
+  // Personal sign-ins live in the profile's file token, never the shared OS keyring. The CLI
+  // resolves its token from $HOME, so HOME is what isolates one instance from another.
+  if (options.isolatedHome !== undefined) {
+    env.HOME = options.isolatedHome;
+    env.USERPROFILE = options.isolatedHome;
+  }
+  // Keep GEMINI_HOME at the isolated empty config root so no global or profile MCP servers or
+  // hooks load during a background usage read.
+  if (options.isolatedGeminiHome !== undefined) {
+    env.GEMINI_HOME = options.isolatedGeminiHome;
+  }
+  if (options.authMethod === "oauth-personal") {
+    env.AGY_CLI_FORCE_FILE_TOKEN_STORAGE = "1";
+  }
+  if (options.authMethod === "oauth-business") {
+    if (options.gcpProject !== undefined) env.GOOGLE_CLOUD_PROJECT = options.gcpProject;
+    if (options.gcpLocation !== undefined) env.GOOGLE_CLOUD_LOCATION = options.gcpLocation;
   }
   // agy requires "true" (not "1") to suppress background self-updates during probes.
   env.AGY_CLI_DISABLE_AUTO_UPDATE = "true";
@@ -295,17 +334,47 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
   readonly authMethod: AntigravitySettings["authMethod"];
   readonly baseEnv: NodeJS.ProcessEnv;
   readonly profileDirectory?: string;
+  readonly gcpProject?: string;
+  readonly gcpLocation?: string;
   readonly resolveExecutable: Effect.Effect<AntigravityExecutable, AntigravityInstallationError>;
 }) {
   const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const platform = yield* HostProcess.Platform;
 
   let generation = 0;
   let cached: { readonly limits: ServerProviderUsageLimits; readonly cachedAt: number } | undefined;
+  let lastAttemptAtMs = 0;
+  let lastCliRunAtMs = 0;
   let verifiedVersion: { readonly path: string; readonly supported: boolean } | undefined;
   let latchedModelTurnPath: string | undefined;
   let signedOutHoldPath: string | undefined;
+  const probeGate = yield* Semaphore.make(1);
+
+  const makeIsolatedCliHome = Effect.fn("antigravityUsageLimits.makeIsolatedCliHome")(function* () {
+    const isolatedHome = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-agy-usage-" });
+    const isolatedGeminiHome = path.join(isolatedHome, ".gemini");
+    const cliDir = path.join(isolatedGeminiHome, "antigravity-cli");
+    const configDir = path.join(isolatedGeminiHome, "config");
+    yield* fileSystem.makeDirectory(cliDir, { recursive: true });
+    yield* fileSystem.makeDirectory(configDir, { recursive: true });
+    yield* fileSystem.writeFileString(
+      path.join(cliDir, "settings.json"),
+      encodeIsolatedCliSettings({
+        trustedWorkspaces: [isolatedHome],
+        onboardingComplete: true,
+        colorScheme: "terminal",
+      }),
+    );
+    yield* fileSystem.writeFileString(
+      path.join(cliDir, "onboarding.json"),
+      encodeIsolatedCliOnboarding({ onboardingComplete: true, completed: true }),
+    );
+    yield* fileSystem.writeFileString(path.join(configDir, "mcp_config.json"), '{"mcpServers":{}}');
+    yield* fileSystem.writeFileString(path.join(configDir, "hooks.json"), "{}");
+    return { isolatedHome, isolatedGeminiHome, cliDir };
+  });
 
   const checkVersion = Effect.fn("antigravityUsageLimits.checkVersion")(function* (
     executable: AntigravityExecutable,
@@ -359,8 +428,50 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
       return makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" });
     }
 
+    // Fresh cache: a settled turn or a health check should not respawn the CLI.
     if (cached !== undefined && requestedAt - cached.cachedAt < CACHE_TTL_MS) {
       return cached.limits;
+    }
+
+    // A recent failed attempt backs off instead of relaunching the CLI on every health check.
+    if (lastAttemptAtMs > 0 && requestedAt - lastAttemptAtMs < FAIL_COOLDOWN_MS) {
+      return (
+        cached?.limits ??
+        makeUnavailableUsageLimits({
+          checkedAt,
+          reason: "probeFailed",
+          message: "Could not read Antigravity limits. Refresh provider status to retry.",
+        })
+      );
+    }
+
+    // One CLI run per interval: each run refreshes the profile's OAuth token, so polling faster
+    // would race the session's own refresh.
+    if (
+      cached !== undefined &&
+      lastCliRunAtMs > 0 &&
+      requestedAt - lastCliRunAtMs < MIN_CLI_INTERVAL_MS
+    ) {
+      return cached.limits;
+    }
+
+    // Personal OAuth profiles are isolated per profile directory via file token storage; do not
+    // fall through to a standalone host sign-in when the profile has no saved token.
+    const profileTokenPath =
+      input.profileDirectory === undefined
+        ? undefined
+        : path.join(input.profileDirectory, ...PROFILE_TOKEN_SEGMENTS);
+    if (input.authMethod === "oauth-personal") {
+      const hasProfileToken =
+        profileTokenPath !== undefined &&
+        (yield* fileSystem.exists(profileTokenPath).pipe(Effect.orElseSucceed(() => false)));
+      if (!hasProfileToken) {
+        return makeUnavailableUsageLimits({
+          checkedAt,
+          reason: "unsupported",
+          message: "Sign in with Google to see Antigravity limits.",
+        });
+      }
     }
 
     const executableOption = yield* input.resolveExecutable.pipe(Effect.option);
@@ -389,29 +500,48 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
       });
     }
 
-    const env = buildUsageCliEnv(input.baseEnv, input.profileDirectory);
-    const versionStatus = yield* checkVersion(executable, env);
-    if (versionStatus === "unsupported") {
-      return makeUnavailableUsageLimits({
-        checkedAt,
-        reason: "unsupported",
-        message: `Antigravity CLI ${MIN_USAGE_CLI_VERSION} or newer is required to read usage limits.`,
-      });
-    }
-    if (versionStatus === "failed") {
-      return makeUnavailableUsageLimits({
-        checkedAt,
-        reason: "probeFailed",
-        message: "Could not verify the Antigravity CLI version. Refresh provider status to retry.",
-      });
-    }
-
-    const nullDevice = platform === "win32" ? "NUL" : "/dev/null";
-    const outcome = yield* Effect.scoped(
+    const cliRun = yield* Effect.scoped(
       Effect.gen(function* () {
-        const cwd = yield* fileSystem.makeTempDirectoryScoped({
-          prefix: "t3-antigravity-usage-",
+        const isolated = yield* makeIsolatedCliHome();
+        const env = buildUsageCliEnv(input.baseEnv, {
+          authMethod: input.authMethod,
+          // Enterprise (`oauth-business`) may keep credentials in the macOS login keychain, so it
+          // keeps the real HOME on darwin to avoid "Keychain Not Found" prompts.
+          ...(platform === "darwin" && input.authMethod !== "oauth-personal"
+            ? {}
+            : { isolatedHome: isolated.isolatedHome }),
+          isolatedGeminiHome: isolated.isolatedGeminiHome,
+          ...(input.authMethod === "oauth-business" && input.gcpProject !== undefined
+            ? { gcpProject: input.gcpProject }
+            : {}),
+          ...(input.authMethod === "oauth-business" && input.gcpLocation !== undefined
+            ? { gcpLocation: input.gcpLocation }
+            : {}),
         });
+
+        // The CLI resolves its token from $HOME and prefers the OS keyring unless file storage is
+        // forced. Copying the profile's own token keeps each instance on its own account and never
+        // writes the shared keyring.
+        const isolatedTokenPath = path.join(isolated.cliDir, "antigravity-oauth-token");
+        const profileToken =
+          profileTokenPath === undefined
+            ? undefined
+            : yield* fileSystem
+                .readFileString(profileTokenPath)
+                .pipe(Effect.orElseSucceed(() => undefined));
+        if (profileToken !== undefined) {
+          yield* fileSystem.writeFileString(isolatedTokenPath, profileToken);
+        }
+
+        const versionStatus = yield* checkVersion(executable, env);
+        if (versionStatus !== "supported") {
+          return { kind: "blocked" as const, versionStatus };
+        }
+
+        // Keep the CLI's own log: it reports the account it authenticated as, which is the only
+        // evidence that the forced file token won over another sign-in.
+        const cliLogPath = path.join(isolated.isolatedHome, "usage-cli.log");
+        lastCliRunAtMs = yield* Clock.currentTimeMillis;
         const child = yield* spawner.spawn(
           ChildProcess.make(
             executable.executablePath,
@@ -423,10 +553,13 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
               "--print-timeout",
               "20s",
               "--log-file",
-              nullDevice,
+              cliLogPath,
+              ...(input.authMethod === "oauth-business" && input.gcpProject !== undefined
+                ? ["--project", input.gcpProject]
+                : []),
             ],
             {
-              cwd,
+              cwd: isolated.isolatedHome,
               env,
               extendEnv: false,
               shell: false,
@@ -468,14 +601,81 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
           { concurrency: "unbounded" },
         );
         stderrChunks.push(decoder.decode());
+        const refreshedToken =
+          profileToken === undefined
+            ? undefined
+            : yield* fileSystem
+                .readFileString(isolatedTokenPath)
+                .pipe(Effect.orElseSucceed(() => undefined));
+        const cliLog = yield* fileSystem
+          .readFileString(cliLogPath)
+          .pipe(Effect.orElseSucceed(() => ""));
         return {
-          stdout: stdout.text,
-          stderr: stderrChunks.join(""),
-          interactiveSignIn,
+          kind: "run" as const,
+          profileToken,
+          refreshedToken,
+          cliLog,
+          outcome: {
+            stdout: stdout.text,
+            stderr: stderrChunks.join(""),
+            interactiveSignIn,
+          },
         };
       }),
+    ).pipe(
+      Effect.tapError(() =>
+        Effect.gen(function* () {
+          if (readGeneration === generation) {
+            lastAttemptAtMs = yield* Clock.currentTimeMillis;
+          }
+        }),
+      ),
     );
 
+    if (cliRun.kind === "blocked") {
+      return makeUnavailableUsageLimits({
+        checkedAt,
+        reason: cliRun.versionStatus === "unsupported" ? "unsupported" : "probeFailed",
+        message:
+          cliRun.versionStatus === "unsupported"
+            ? `Antigravity CLI ${MIN_USAGE_CLI_VERSION} or newer is required to read usage limits.`
+            : "Could not verify the Antigravity CLI version. Refresh provider status to retry.",
+      });
+    }
+
+    const profileEmail = antigravityTokenEmail(cliRun.profileToken);
+    // The CLI refreshes expired tokens in place; carry that back so the profile stays signed in.
+    // Only the same account's token may replace the profile's saved sign-in.
+    if (
+      cliRun.refreshedToken !== undefined &&
+      cliRun.refreshedToken !== cliRun.profileToken &&
+      profileEmail !== undefined &&
+      antigravityTokenEmail(cliRun.refreshedToken) === profileEmail &&
+      profileTokenPath !== undefined
+    ) {
+      yield* fileSystem
+        .writeFileString(profileTokenPath, cliRun.refreshedToken)
+        .pipe(Effect.orElseSucceed(() => undefined));
+    }
+
+    const authenticatedEmail = parseAntigravityAuthEmail(cliRun.cliLog);
+    if (
+      profileEmail !== undefined &&
+      authenticatedEmail !== undefined &&
+      authenticatedEmail.trim().toLowerCase() !== profileEmail.trim().toLowerCase()
+    ) {
+      if (readGeneration === generation) {
+        lastAttemptAtMs = yield* Clock.currentTimeMillis;
+      }
+      return makeUnavailableUsageLimits({
+        checkedAt,
+        reason: "probeFailed",
+        message:
+          "Antigravity signed in with a different Google account than this provider's saved sign-in. Sign in again in this provider to keep its threads and quota on one account.",
+      });
+    }
+
+    const outcome = cliRun.outcome;
     if (antigravityOutputShowsModelTurn(outcome.stdout)) {
       if (readGeneration === generation) latchedModelTurnPath = executable.executablePath;
       return makeUnavailableUsageLimits({
@@ -500,6 +700,9 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
 
     const windows = antigravityCliUsageWindows(outcome.stdout, requestedAt);
     if (!windows || windows.length === 0) {
+      if (readGeneration === generation) {
+        lastAttemptAtMs = yield* Clock.currentTimeMillis;
+      }
       return makeUnavailableUsageLimits({
         checkedAt,
         reason: "probeFailed",
@@ -510,28 +713,40 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
     const limits = makeUsageLimits({ checkedAt, windows });
     if (readGeneration === generation) {
       cached = { limits, cachedAt: requestedAt };
+      lastAttemptAtMs = 0;
       signedOutHoldPath = undefined;
     }
     return limits;
   });
 
-  const probe: Effect.Effect<ServerProviderUsageLimits> = read().pipe(
-    Effect.timeout(USAGE_PROBE_TIMEOUT),
-    Effect.catch(() =>
-      Effect.gen(function* () {
-        return makeUnavailableUsageLimits({
-          checkedAt: DateTime.formatIso(yield* DateTime.now),
-          reason: "probeFailed",
-          message: "Could not read Antigravity limits. Refresh provider status to retry.",
-        });
-      }),
-    ),
-  );
+  const probe: Effect.Effect<ServerProviderUsageLimits> = probeGate
+    .withPermits(1)(read())
+    .pipe(
+      Effect.timeout(USAGE_PROBE_TIMEOUT),
+      Effect.catch(() =>
+        Effect.gen(function* () {
+          if (cached !== undefined) return cached.limits;
+          return makeUnavailableUsageLimits({
+            checkedAt: DateTime.formatIso(yield* DateTime.now),
+            reason: "probeFailed",
+            message: "Could not read Antigravity limits. Refresh provider status to retry.",
+          });
+        }),
+      ),
+    );
 
   return {
     probe,
+    // Manual refresh drops the TTL and any failure hold, but the per-interval floor still applies
+    // so the session's own token refresh is never raced.
+    invalidateCache: Effect.sync(() => {
+      if (cached !== undefined) cached = { ...cached, cachedAt: 0 };
+      lastAttemptAtMs = 0;
+    }),
     clear: Effect.sync(() => {
       cached = undefined;
+      lastAttemptAtMs = 0;
+      lastCliRunAtMs = 0;
       signedOutHoldPath = undefined;
       generation++;
     }),

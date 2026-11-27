@@ -217,6 +217,7 @@ interface AntigravityProviderOptions {
     readonly observedEmail: Effect.Effect<string | undefined>;
   };
   readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits>;
+  readonly invalidateUsageCache?: Effect.Effect<void>;
   readonly clearUsage?: Effect.Effect<void>;
   readonly maintenanceCapabilities?: ProviderMaintenanceCapabilities;
   readonly auth?: { readonly type: string; readonly label: string };
@@ -514,6 +515,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     haveSettingsChanged: () => false,
     initialSnapshot: () => getSnapshot,
     checkProvider: checkProvider(),
+    ...(options.invalidateUsageCache ? { invalidateUsageCache: options.invalidateUsageCache } : {}),
     enrichSnapshot: ({ publishSnapshot }) =>
       SubscriptionRef.changes(metadata).pipe(
         Stream.runForEach((state) =>

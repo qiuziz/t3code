@@ -604,6 +604,8 @@ export const AntigravityDriver: ProviderDriver<
       authMethod: auth.authMethod,
       baseEnv: processEnvironment,
       profileDirectory,
+      gcpProject: auth.gcpProject,
+      gcpLocation: auth.gcpLocation,
       resolveExecutable: installation.resolve(settings.binaryPath, processEnvironment),
     }).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
@@ -615,6 +617,7 @@ export const AntigravityDriver: ProviderDriver<
       probe,
       ...(accountIdentity ? { accountIdentity } : {}),
       probeUsage: usage.probe,
+      invalidateUsageCache: usage.invalidateCache,
       clearUsage: usage.clear,
       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
       ...(rememberedRuntimeModes ? { rememberedRuntimeModes } : {}),

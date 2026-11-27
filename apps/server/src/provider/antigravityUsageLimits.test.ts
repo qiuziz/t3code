@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - fixture setup and spawn callbacks inspect temp files synchronously.
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -6,12 +7,36 @@ import * as Layer from "effect/Layer";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 import {
   antigravityCliUsageWindows,
   antigravityOutputShowsModelTurn,
   makeAntigravityUsageProbe,
 } from "./antigravityUsageLimits.ts";
+
+const PROFILE_TOKEN = JSON.stringify({ id_token_email: "profile@example.com" });
+
+function makeProfileDirectory(): string {
+  const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-agy-profile-"));
+  NodeFS.mkdirSync(NodePath.join(dir, "antigravity-acp"), { recursive: true });
+  NodeFS.writeFileSync(
+    NodePath.join(dir, "antigravity-acp", "antigravity-oauth-token"),
+    PROFILE_TOKEN,
+  );
+  return dir;
+}
+
+function argAfter(args: ReadonlyArray<string>, flag: string): string | undefined {
+  const index = args.indexOf(flag);
+  return index === -1 ? undefined : args[index + 1];
+}
+
+function isolatedTokenPath(home: string): string {
+  return NodePath.join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+}
 
 const SAMPLE_USAGE_STDOUT = JSON.stringify({
   conversation_id: "",
@@ -223,26 +248,34 @@ describe("makeAntigravityUsageProbe", () => {
   );
 
   it.effect(
-    "reads limits via agy -p /usage, strips sensitive env vars, and caches within TTL",
+    "reads limits via agy -p /usage, isolates the profile token, strips sensitive env vars, and caches",
     () =>
       Effect.gen(function* () {
+        const profileDirectory = makeProfileDirectory();
         const calls: Array<{
           readonly command: string;
           readonly args: ReadonlyArray<string>;
+          readonly cwd: string | undefined;
           readonly env: Record<string, string | undefined>;
+          readonly copiedToken: string | undefined;
         }> = [];
         const spawner = ChildProcessSpawner.make((command) => {
           if (command._tag !== "StandardCommand") return Effect.die("Expected StandardCommand");
+          const cwd = command.options.cwd;
           calls.push({
             command: command.command,
             args: command.args.map(String),
+            cwd,
             env: (command.options.env ?? {}) as Record<string, string | undefined>,
+            // The isolated HOME only lives for the probe run, so read the copied token here.
+            copiedToken:
+              cwd === undefined ? undefined : NodeFS.readFileSync(isolatedTokenPath(cwd), "utf8"),
           });
           return Effect.succeed(makeMockHandle({ stdout: SAMPLE_USAGE_STDOUT }));
         });
         const usage = yield* makeAntigravityUsageProbe({
           authMethod: "oauth-personal",
-          profileDirectory: "/tmp/t3-profile",
+          profileDirectory,
           baseEnv: {
             PATH: "/usr/bin",
             GEMINI_API_KEY: "secret",
@@ -274,18 +307,21 @@ describe("makeAntigravityUsageProbe", () => {
           "gemini-weekly",
         ]);
         expect(calls).toHaveLength(1);
-        expect(calls[0]?.args).toEqual([
-          "-p",
-          "/usage",
-          "--output-format",
-          "json",
-          "--print-timeout",
-          "20s",
-          "--log-file",
-          "/dev/null",
-        ]);
+        expect(calls[0]?.args.slice(0, 4)).toEqual(["-p", "/usage", "--output-format", "json"]);
+        expect(calls[0]?.args).toContain("--print-timeout");
+        const isolatedHome = calls[0]?.env.HOME;
+        expect(isolatedHome).toBeTruthy();
+        expect(calls[0]?.cwd).toBe(isolatedHome);
+        expect(calls[0]?.env.USERPROFILE).toBe(isolatedHome);
+        expect(calls[0]?.env.GEMINI_HOME).toBe(NodePath.join(isolatedHome!, ".gemini"));
+        expect(calls[0]?.env.AGY_CLI_FORCE_FILE_TOKEN_STORAGE).toBe("1");
         expect(calls[0]?.env.AGY_CLI_DISABLE_AUTO_UPDATE).toBe("true");
-        expect(calls[0]?.env.GEMINI_HOME).toBe("/tmp/t3-profile");
+        expect(argAfter(calls[0]?.args ?? [], "--log-file")).toBe(
+          NodePath.join(isolatedHome!, "usage-cli.log"),
+        );
+        // The probe copies only the profile's own token into the isolated HOME; the shared OS
+        // keyring is never read or written.
+        expect(calls[0]?.copiedToken).toBe(PROFILE_TOKEN);
         expect(calls[0]?.env.GEMINI_API_KEY).toBeUndefined();
         expect(calls[0]?.env.SSH_CONNECTION).toBeUndefined();
         expect(calls[0]?.env.SSH_AUTH_SOCK).toBeUndefined();
@@ -296,7 +332,12 @@ describe("makeAntigravityUsageProbe", () => {
         expect(second).toEqual(first);
         expect(calls).toHaveLength(1);
 
-        // Clearing cache allows a fresh read.
+        // A manual refresh drops the TTL, but the per-interval floor still prevents a relaunch.
+        yield* usage.invalidateCache;
+        yield* usage.probe;
+        expect(calls).toHaveLength(1);
+
+        // Clearing the account cache allows a fresh read.
         yield* usage.clear;
         yield* usage.probe;
         expect(calls).toHaveLength(2);
@@ -321,6 +362,7 @@ describe("makeAntigravityUsageProbe", () => {
       });
       const usage = yield* makeAntigravityUsageProbe({
         authMethod: "oauth-personal",
+        profileDirectory: makeProfileDirectory(),
         baseEnv: {},
         resolveExecutable: Effect.succeed({
           executablePath: "/opt/agy",
@@ -371,6 +413,7 @@ describe("makeAntigravityUsageProbe", () => {
       });
       const usage = yield* makeAntigravityUsageProbe({
         authMethod: "oauth-personal",
+        profileDirectory: makeProfileDirectory(),
         baseEnv: {},
         resolveExecutable: Effect.succeed({
           executablePath: "/opt/agy",
@@ -414,6 +457,7 @@ describe("makeAntigravityUsageProbe", () => {
       });
       const usage = yield* makeAntigravityUsageProbe({
         authMethod: "oauth-personal",
+        profileDirectory: makeProfileDirectory(),
         baseEnv: {},
         resolveExecutable: Effect.succeed({
           executablePath: "/usr/local/bin/agy",
@@ -438,6 +482,105 @@ describe("makeAntigravityUsageProbe", () => {
       expect(second.unavailable).toBeUndefined();
       expect(second.windows).toHaveLength(4);
       expect(versionCalls).toBe(2);
+    }),
+  );
+
+  it.effect("refuses a reading when the CLI authenticated as another account", () =>
+    Effect.gen(function* () {
+      const profileDirectory = makeProfileDirectory();
+      const spawner = ChildProcessSpawner.make((command) => {
+        if (command._tag !== "StandardCommand") return Effect.die("Expected StandardCommand");
+        const logPath = argAfter(command.args.map(String), "--log-file");
+        if (logPath !== undefined) {
+          NodeFS.writeFileSync(
+            logPath,
+            "applyAuthResult: email=other@example.com, authMethod=consumer\n",
+          );
+        }
+        // Another account's token must never replace the profile's saved sign-in.
+        NodeFS.writeFileSync(
+          isolatedTokenPath(command.options.cwd!),
+          JSON.stringify({ id_token_email: "other@example.com" }),
+        );
+        return Effect.succeed(makeMockHandle({ stdout: SAMPLE_USAGE_STDOUT }));
+      });
+      const usage = yield* makeAntigravityUsageProbe({
+        authMethod: "oauth-personal",
+        profileDirectory,
+        baseEnv: {},
+        resolveExecutable: Effect.succeed({
+          executablePath: "/opt/agy",
+          source: "managed",
+          version: "1.5.14",
+          managedVersionDirectory: null,
+        }),
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Layer.succeed(HostProcess.Platform, "linux"),
+          ),
+        ),
+      );
+      const limits = yield* usage.probe;
+      expect(limits.unavailable?.reason).toBe("probeFailed");
+      expect(limits.unavailable?.message).toContain("different Google account");
+      expect(
+        NodeFS.readFileSync(
+          NodePath.join(profileDirectory, "antigravity-acp", "antigravity-oauth-token"),
+          "utf8",
+        ),
+      ).toBe(PROFILE_TOKEN);
+    }),
+  );
+
+  it.effect("carries a refreshed profile token back for the same account", () =>
+    Effect.gen(function* () {
+      const profileDirectory = makeProfileDirectory();
+      const refreshed = JSON.stringify({
+        id_token_email: "profile@example.com",
+        token: { access_token: "refreshed" },
+      });
+      const spawner = ChildProcessSpawner.make((command) => {
+        if (command._tag !== "StandardCommand") return Effect.die("Expected StandardCommand");
+        const logPath = argAfter(command.args.map(String), "--log-file");
+        if (logPath !== undefined) {
+          NodeFS.writeFileSync(
+            logPath,
+            "applyAuthResult: email=profile@example.com, authMethod=consumer\n",
+          );
+        }
+        NodeFS.writeFileSync(isolatedTokenPath(command.options.cwd!), refreshed);
+        return Effect.succeed(makeMockHandle({ stdout: SAMPLE_USAGE_STDOUT }));
+      });
+      const usage = yield* makeAntigravityUsageProbe({
+        authMethod: "oauth-personal",
+        profileDirectory,
+        baseEnv: {},
+        resolveExecutable: Effect.succeed({
+          executablePath: "/opt/agy",
+          source: "managed",
+          version: "1.5.14",
+          managedVersionDirectory: null,
+        }),
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Layer.succeed(HostProcess.Platform, "linux"),
+          ),
+        ),
+      );
+      const limits = yield* usage.probe;
+      expect(limits.unavailable).toBeUndefined();
+      expect(
+        NodeFS.readFileSync(
+          NodePath.join(profileDirectory, "antigravity-acp", "antigravity-oauth-token"),
+          "utf8",
+        ),
+      ).toBe(refreshed);
     }),
   );
 });
